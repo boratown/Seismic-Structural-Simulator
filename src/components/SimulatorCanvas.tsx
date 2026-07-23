@@ -21,7 +21,7 @@ import {
 } from '../types';
 import { FRAMEWORK_MATERIALS, WALL_MATERIALS, UTILITIES } from '../constants';
 import { getMaterialTextures } from '../utils/textureGenerator';
-import { Eye, ShieldAlert, Coins, Weight, HelpCircle, Construction, Zap, FlameKindling, Waves, Wind, Droplets, Navigation, Box, Search, Copy, MapPin, Trash2, X, Filter, RotateCw, Move, Maximize2 } from 'lucide-react';
+import { Eye, ShieldAlert, Coins, Weight, HelpCircle, Construction, Zap, FlameKindling, Waves, Wind, Droplets, Navigation, Box, Search, Copy, MapPin, Trash2, X, Filter, RotateCw, Move, Maximize2, Hand, BoxSelect, Sparkles } from 'lucide-react';
 
 interface SimulatorCanvasProps {
   stage: 'framing' | 'cladding' | 'testing';
@@ -102,15 +102,58 @@ export default function SimulatorCanvas({
   // Interaction variables
   const [is3D, setIs3D] = useState(true);
   const [isAltPressed, setIsAltPressed] = useState(false);
-  const [mouseMode, setMouseMode] = useState<'build' | 'position' | 'rotation' | 'scale'>('build');
+  const [mouseMode, setMouseMode] = useState<'build' | 'position' | 'rotation' | 'scale' | 'drag' | 'select' | 'weld'>('build');
+
+  // Context Menu & Clipboard State
+  const [contextMenu, setContextMenu] = useState<{
+    show: boolean;
+    x: number;
+    y: number;
+    targetId: string | null;
+    targetType: 'frame' | 'wall' | 'utility' | null;
+    hitPoint: { x: number; y: number; z: number } | null;
+  }>({ show: false, x: 0, y: 0, targetId: null, targetType: null, hitPoint: null });
+
+  const [copiedElement, setCopiedElement] = useState<{
+    type: 'frame' | 'wall' | 'utility';
+    data: any;
+  } | null>(null);
+
+  const [copiedElements, setCopiedElements] = useState<Array<{
+    type: 'frame' | 'wall' | 'utility';
+    data: any;
+  }>>([]);
+
+  const [selectedDebugIds, setSelectedDebugIds] = useState<string[]>([]);
+  const selectedDebugIdsRef = useRef<string[]>([]);
+  useEffect(() => {
+    selectedDebugIdsRef.current = selectedDebugIds;
+    if (updateThreeMultiSelectionHighlightsRef.current) {
+      updateThreeMultiSelectionHighlightsRef.current();
+    }
+  }, [selectedDebugIds]);
+
+  const [selectionBox, setSelectionBox] = useState<{
+    show: boolean;
+    startX: number;
+    startY: number;
+    currentX: number;
+    currentY: number;
+  }>({ show: false, startX: 0, startY: 0, currentX: 0, currentY: 0 });
   
   const isAltPressedRef = useRef(false);
-  const mouseModeRef = useRef<'build' | 'position' | 'rotation' | 'scale'>('build');
+  const mouseModeRef = useRef<'build' | 'position' | 'rotation' | 'scale' | 'drag' | 'select' | 'weld'>('build');
+  const updateThreeMultiSelectionHighlightsRef = useRef<() => void>(() => {});
 
+  const onAddFrameRef = useRef(onAddFrame);
+  const onAddWallRef = useRef(onAddWall);
+  const onAddUtilityRef = useRef(onAddUtility);
   const onUpdateFrameRef = useRef(onUpdateFrame);
   const onUpdateWallRef = useRef(onUpdateWall);
   const onUpdateUtilityRef = useRef(onUpdateUtility);
+  const onDeleteElementRef = useRef(onDeleteElement);
   const buildThreeMeshesRef = useRef<() => void>(() => {});
+  const spawnDebrisParticlesRef = useRef<(x: number, y: number, z: number, count?: number) => void>(() => {});
 
   // Persistent camera parameters across rerenders / rebuilds
   const cameraTargetRef = useRef(new THREE.Vector3(0, 4, 0));
@@ -254,13 +297,29 @@ export default function SimulatorCanvas({
   useEffect(() => { is3DRef.current = is3D; }, [is3D]);
   useEffect(() => { activeAiTimelineStepRef.current = activeAiTimelineStep; }, [activeAiTimelineStep]);
   useEffect(() => { mouseModeRef.current = mouseMode; }, [mouseMode]);
+  useEffect(() => { onAddFrameRef.current = onAddFrame; }, [onAddFrame]);
+  useEffect(() => { onAddWallRef.current = onAddWall; }, [onAddWall]);
+  useEffect(() => { onAddUtilityRef.current = onAddUtility; }, [onAddUtility]);
   useEffect(() => { onUpdateFrameRef.current = onUpdateFrame; }, [onUpdateFrame]);
   useEffect(() => { onUpdateWallRef.current = onUpdateWall; }, [onUpdateWall]);
   useEffect(() => { onUpdateUtilityRef.current = onUpdateUtility; }, [onUpdateUtility]);
+  useEffect(() => { onDeleteElementRef.current = onDeleteElement; }, [onDeleteElement]);
+
+  // Close context menu on any mouse down
+  useEffect(() => {
+    const closeMenu = (e: MouseEvent) => {
+      // If right click, let handleContextMenuEvent handle it
+      if (e.button === 2) return;
+      setContextMenu(prev => prev.show ? { ...prev, show: false } : prev);
+    };
+    window.addEventListener('mousedown', closeMenu);
+    return () => window.removeEventListener('mousedown', closeMenu);
+  }, []);
 
   // Handle hotkeys & state
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
       if (e.key === 'Shift') {
         setIs3D(prev => !prev);
       }
@@ -274,8 +333,15 @@ export default function SimulatorCanvas({
           if (prev === 'build') return 'position';
           if (prev === 'position') return 'rotation';
           if (prev === 'rotation') return 'scale';
+          if (prev === 'scale') return 'select';
           return 'build';
         });
+      }
+      if (e.key.toLowerCase() === 's') {
+        setMouseMode(prev => prev === 'select' ? 'build' : 'select');
+      }
+      if (e.key.toLowerCase() === 'e') {
+        setMouseMode(prev => prev === 'weld' ? 'build' : 'weld');
       }
     };
 
@@ -335,8 +401,12 @@ export default function SimulatorCanvas({
 
     const cloudTexture = new THREE.Data3DTexture( data, size, size, size );
     cloudTexture.format = THREE.RedFormat;
+    cloudTexture.type = THREE.UnsignedByteType;
     cloudTexture.minFilter = THREE.LinearFilter;
     cloudTexture.magFilter = THREE.LinearFilter;
+    cloudTexture.wrapS = THREE.ClampToEdgeWrapping;
+    cloudTexture.wrapT = THREE.ClampToEdgeWrapping;
+    cloudTexture.wrapR = THREE.ClampToEdgeWrapping;
     cloudTexture.unpackAlignment = 1;
     cloudTexture.needsUpdate = true;
 
@@ -397,7 +467,7 @@ export default function SimulatorCanvas({
         return vec2( t0, t1 );
       }
       float sample1( vec3 p ) {
-        return texture( map, p ).r;
+        return texture( map, clamp( p, 0.001, 0.999 ) ).r;
       }
       float shading( vec3 coord ) {
         float step = 0.01;
@@ -458,9 +528,9 @@ export default function SimulatorCanvas({
         const sY = 15 + Math.random() * 10;
         const sZ = 30 + Math.random() * 20;
         mesh.scale.set(sX, sY, sZ);
-        const cX = (Math.random() - 0.5) * 80;
-        const cY = 25 + (Math.random() - 0.5) * 8;
-        const cZ = (Math.random() - 0.5) * 80;
+        const cX = (Math.random() - 0.5) * 100;
+        const cY = 45 + (Math.random() - 0.5) * 10;
+        const cZ = (Math.random() - 0.5) * 100;
         mesh.position.set(cX, cY, cZ);
         cloudGroup.add(mesh);
       }
@@ -597,6 +667,102 @@ export default function SimulatorCanvas({
     debugGizmoGroup.visible = false;
     scene.add(debugGizmoGroup);
 
+    const multiSelectionGroup = new THREE.Group();
+    scene.add(multiSelectionGroup);
+
+    updateThreeMultiSelectionHighlightsRef.current = () => {
+      // Clear previous children
+      while (multiSelectionGroup.children.length > 0) {
+        const child = multiSelectionGroup.children[0];
+        if ((child as any).geometry) (child as any).geometry.dispose();
+        if ((child as any).material) (child as any).material.dispose();
+        multiSelectionGroup.remove(child);
+      }
+
+      const ids = selectedDebugIdsRef.current;
+      ids.forEach(id => {
+        let targetPos: { x: number; y: number; z: number } | null = null;
+        let targetSize: { x: number; y: number; z: number } = { x: 1.0, y: 1.0, z: 1.0 };
+        let targetRotY = 0;
+
+        const targetFrame = framesRef.current.find(f => f.id === id);
+        if (targetFrame) {
+          targetPos = {
+            x: (targetFrame.start.x + targetFrame.end.x) / 2,
+            y: (targetFrame.start.y + targetFrame.end.y) / 2,
+            z: (targetFrame.start.z + targetFrame.end.z) / 2,
+          };
+          const len = Math.max(0.2, Math.hypot(
+            targetFrame.end.x - targetFrame.start.x,
+            targetFrame.end.y - targetFrame.start.y,
+            targetFrame.end.z - targetFrame.start.z
+          ));
+          const thick = Math.max(0.15, (FRAMEWORK_MATERIALS[targetFrame.material]?.thickness || 0.15) * 1.5);
+          targetSize = { x: thick, y: thick, z: len };
+
+          const startVec = new THREE.Vector3(targetFrame.start.x, targetFrame.start.y, targetFrame.start.z);
+          const endVec = new THREE.Vector3(targetFrame.end.x, targetFrame.end.y, targetFrame.end.z);
+          const dir = new THREE.Vector3().subVectors(endVec, startVec);
+          targetRotY = Math.atan2(dir.x, dir.z);
+        } else {
+          const targetWall = wallsRef.current.find(w => w.id === id);
+          if (targetWall) {
+            targetPos = {
+              x: (targetWall.start.x + targetWall.end.x) / 2,
+              y: (targetWall.start.y + targetWall.end.y) / 2,
+              z: (targetWall.start.z + targetWall.end.z) / 2,
+            };
+            const wLen = Math.max(0.3, Math.hypot(
+              targetWall.end.x - targetWall.start.x,
+              targetWall.end.y - targetWall.start.y
+            ));
+            const wHeight = Math.max(0.5, Math.abs(targetWall.end.z - targetWall.start.z) || 3.0);
+            targetSize = { x: wLen, y: wHeight, z: 0.25 };
+
+            const startVec = new THREE.Vector3(targetWall.start.x, targetWall.start.y, targetWall.start.z);
+            const endVec = new THREE.Vector3(targetWall.end.x, targetWall.end.y, targetWall.end.z);
+            const dir = new THREE.Vector3().subVectors(endVec, startVec);
+            targetRotY = Math.atan2(dir.x, dir.z);
+          } else {
+            const targetUtil = utilitiesRef.current.find(u => u.id === id);
+            if (targetUtil) {
+              targetPos = { 
+                x: targetUtil.position.x, 
+                y: targetUtil.position.y, 
+                z: targetUtil.position.z 
+              };
+              targetSize = { x: 0.6, y: 0.6, z: 0.6 };
+            }
+          }
+        }
+
+        if (targetPos) {
+          const highlightBoxGeo = new THREE.BoxGeometry(targetSize.x, targetSize.y, targetSize.z);
+          const highlightBoxMat = new THREE.MeshBasicMaterial({
+            color: '#38bdf8',
+            wireframe: true,
+            transparent: true,
+            opacity: 0.8,
+          });
+          const mesh = new THREE.Mesh(highlightBoxGeo, highlightBoxMat);
+          mesh.position.set(targetPos.x, targetPos.y, targetPos.z);
+          mesh.rotation.y = targetRotY;
+          multiSelectionGroup.add(mesh);
+
+          const fillGeo = new THREE.BoxGeometry(targetSize.x * 0.98, targetSize.y * 0.98, targetSize.z * 0.98);
+          const fillMat = new THREE.MeshBasicMaterial({
+            color: '#38bdf8',
+            transparent: true,
+            opacity: 0.15,
+          });
+          const fillMesh = new THREE.Mesh(fillGeo, fillMat);
+          fillMesh.position.set(targetPos.x, targetPos.y, targetPos.z);
+          fillMesh.rotation.y = targetRotY;
+          multiSelectionGroup.add(fillMesh);
+        }
+      });
+    };
+
     // --- 3.5. Rotation, Scale, Translation Axes Gizmo Setup ---
     const rotationGizmoGroup = new THREE.Group();
     rotationGizmoGroup.visible = false;
@@ -692,6 +858,45 @@ export default function SimulatorCanvas({
     let dragGizmoStartMousePos = new THREE.Vector2();
     let hoveredGizmoAxis: THREE.Object3D | null = null;
     let originalElementData: any = null;
+    let multiOriginalElementsData: { [id: string]: any } = {};
+    let gizmoPivotPoint = new THREE.Vector3();
+
+    const getMultiSelectionCenter = (): THREE.Vector3 => {
+      const ids = selectedDebugIdsRef.current.length > 0
+        ? selectedDebugIdsRef.current
+        : (selectedDebugIdRef.current ? [selectedDebugIdRef.current] : []);
+      if (ids.length === 0) return new THREE.Vector3();
+      const center = new THREE.Vector3();
+      let count = 0;
+      ids.forEach(id => {
+        const frame = framesRef.current.find(f => f.id === id);
+        if (frame) {
+          center.add(new THREE.Vector3((frame.start.x + frame.end.x) / 2, (frame.start.y + frame.end.y) / 2, (frame.start.z + frame.end.z) / 2));
+          count++;
+        } else {
+          const wall = wallsRef.current.find(w => w.id === id);
+          if (wall) {
+            center.add(new THREE.Vector3((wall.start.x + wall.end.x) / 2, (wall.start.y + wall.end.y) / 2 + getWallHeight(wall) / 2, (wall.start.z + wall.end.z) / 2));
+            count++;
+          } else {
+            const util = utilitiesRef.current.find(u => u.id === id);
+            if (util) {
+              center.add(new THREE.Vector3(util.position.x, util.position.y, util.position.z));
+              count++;
+            }
+          }
+        }
+      });
+      if (count > 0) center.divideScalar(count);
+      return center;
+    };
+
+    // Drag mode element manipulation states inside closure
+    let isDraggingElement = false;
+    let draggedElementId: string | null = null;
+    let draggedElementType: 'frame' | 'wall' | 'utility' | null = null;
+    let dragElementStartIntersection = new THREE.Vector3();
+    let dragElementPlane = new THREE.Plane();
 
     // --- 4. Element Meshes Storage ---
     const frameMeshes = new Map<string, THREE.Object3D>();
@@ -947,6 +1152,7 @@ export default function SimulatorCanvas({
         }
       }
     };
+    spawnDebrisParticlesRef.current = spawnDebrisParticles;
 
     // Debris particle generator initialized for structural simulation
 
@@ -1706,8 +1912,9 @@ export default function SimulatorCanvas({
           const balancedMass = Math.max(5, Math.min(15, 12 * massRatio) * (len / 3.0)); // scaled by length ratio to reflect geometry
           Matter.Body.setMass(barBody, balancedMass);
           
+          const effectiveFrameDurability = spec.durability * (f.welded ? 2.5 : 1.0);
           (barBody as any).shouldBeStatic = false;
-          (barBody as any).durability = spec.durability;
+          (barBody as any).durability = effectiveFrameDurability;
 
           // Store initial position for stability
           (barBody as any).initialX = barBody.position.x;
@@ -1726,10 +1933,10 @@ export default function SimulatorCanvas({
             pointB: { x: - (len * SCALE) / 2, y: 0 },
             stiffness: 1.0
           });
-          (weldStartPos as any).durability = spec.durability;
+          (weldStartPos as any).durability = effectiveFrameDurability;
           (weldStartPos as any).isBroken = false;
-          (weldStartPos as any).desiredStiffness = 1.0;
-          weldStartPos.stiffness = 0.5;
+          (weldStartPos as any).desiredStiffness = f.welded ? 1.0 : 1.0;
+          weldStartPos.stiffness = f.welded ? 0.9 : 0.5;
 
           const leverDist = 15;
           const weldStartRot = createSafeConstraint({
@@ -1739,10 +1946,10 @@ export default function SimulatorCanvas({
             pointB: { x: - (len * SCALE) / 2 + leverDist, y: 0 },
             stiffness: 0.9
           });
-          (weldStartRot as any).durability = spec.durability;
+          (weldStartRot as any).durability = effectiveFrameDurability;
           (weldStartRot as any).isBroken = false;
-          (weldStartRot as any).desiredStiffness = 0.9;
-          weldStartRot.stiffness = 0.5;
+          (weldStartRot as any).desiredStiffness = f.welded ? 1.0 : 0.9;
+          weldStartRot.stiffness = f.welded ? 0.9 : 0.5;
 
           // Link start welds as twins
           (weldStartPos as any).twin = weldStartRot;
@@ -1756,10 +1963,10 @@ export default function SimulatorCanvas({
             pointB: { x: (len * SCALE) / 2, y: 0 },
             stiffness: 1.0
           });
-          (weldEndPos as any).durability = spec.durability;
+          (weldEndPos as any).durability = effectiveFrameDurability;
           (weldEndPos as any).isBroken = false;
-          (weldEndPos as any).desiredStiffness = 1.0;
-          weldEndPos.stiffness = 0.5;
+          (weldEndPos as any).desiredStiffness = f.welded ? 1.0 : 1.0;
+          weldEndPos.stiffness = f.welded ? 0.9 : 0.5;
 
           const weldEndRot = createSafeConstraint({
             bodyA: endJoint.body,
@@ -1768,10 +1975,10 @@ export default function SimulatorCanvas({
             pointB: { x: (len * SCALE) / 2 - leverDist, y: 0 },
             stiffness: 0.9
           });
-          (weldEndRot as any).durability = spec.durability;
+          (weldEndRot as any).durability = effectiveFrameDurability;
           (weldEndRot as any).isBroken = false;
-          (weldEndRot as any).desiredStiffness = 0.9;
-          weldEndRot.stiffness = 0.5;
+          (weldEndRot as any).desiredStiffness = f.welded ? 1.0 : 0.9;
+          weldEndRot.stiffness = f.welded ? 0.9 : 0.5;
 
           // Link end welds as twins
           (weldEndPos as any).twin = weldEndRot;
@@ -1857,6 +2064,8 @@ export default function SimulatorCanvas({
           });
         }
 
+        const effectiveWallDurability = spec.durability * (w.welded ? 2.5 : 1.0);
+
         // Direct Weld to framing joints at wall's endpoints
         if (jointA) {
           const weldAPos = createSafeConstraint({
@@ -1866,10 +2075,10 @@ export default function SimulatorCanvas({
             pointB: { x: -len * SCALE / 2, y: 0 },
             stiffness: 1.0
           });
-          (weldAPos as any).durability = spec.durability;
+          (weldAPos as any).durability = effectiveWallDurability;
           (weldAPos as any).isBroken = false;
-          (weldAPos as any).desiredStiffness = 1.0;
-          weldAPos.stiffness = 0.5;
+          (weldAPos as any).desiredStiffness = w.welded ? 1.0 : 1.0;
+          weldAPos.stiffness = w.welded ? 0.9 : 0.5;
 
           const leverDist = 15;
           const weldARot = createSafeConstraint({
@@ -1879,10 +2088,10 @@ export default function SimulatorCanvas({
             pointB: { x: -len * SCALE / 2 + leverDist, y: 0 },
             stiffness: 0.9
           });
-          (weldARot as any).durability = spec.durability;
+          (weldARot as any).durability = effectiveWallDurability;
           (weldARot as any).isBroken = false;
-          (weldARot as any).desiredStiffness = 0.9;
-          weldARot.stiffness = 0.5;
+          (weldARot as any).desiredStiffness = w.welded ? 1.0 : 0.9;
+          weldARot.stiffness = w.welded ? 0.9 : 0.5;
 
           (weldAPos as any).twin = weldARot;
           (weldARot as any).twin = weldAPos;
@@ -1900,10 +2109,10 @@ export default function SimulatorCanvas({
             pointB: { x: len * SCALE / 2, y: 0 },
             stiffness: 1.0
           });
-          (weldBPos as any).durability = spec.durability;
+          (weldBPos as any).durability = effectiveWallDurability;
           (weldBPos as any).isBroken = false;
-          (weldBPos as any).desiredStiffness = 1.0;
-          weldBPos.stiffness = 0.5;
+          (weldBPos as any).desiredStiffness = w.welded ? 1.0 : 1.0;
+          weldBPos.stiffness = w.welded ? 0.9 : 0.5;
 
           const leverDist = 15;
           const weldBRot = createSafeConstraint({
@@ -1913,10 +2122,10 @@ export default function SimulatorCanvas({
             pointB: { x: len * SCALE / 2 - leverDist, y: 0 },
             stiffness: 0.9
           });
-          (weldBRot as any).durability = spec.durability;
+          (weldBRot as any).durability = effectiveWallDurability;
           (weldBRot as any).isBroken = false;
-          (weldBRot as any).desiredStiffness = 0.9;
-          weldBRot.stiffness = 0.5;
+          (weldBRot as any).desiredStiffness = w.welded ? 1.0 : 0.9;
+          weldBRot.stiffness = w.welded ? 0.9 : 0.5;
 
           (weldBPos as any).twin = weldBRot;
           (weldBRot as any).twin = weldBPos;
@@ -2140,13 +2349,36 @@ const buildThreeMeshes = () => {
         group.quaternion.setFromUnitVectors(alignAxis, direction);
         (group as any).initialQuaternion = group.quaternion.clone();
 
-        const sphereGeo = new THREE.SphereGeometry(radius * 1.3, 8, 8);
-        const sphereMat = new THREE.MeshStandardMaterial({ color: '#4b5563', metalness: 0.9 });
+        const sphereGeo = new THREE.SphereGeometry(radius * (f.welded ? 1.6 : 1.3), 8, 8);
+        const sphereMat = new THREE.MeshStandardMaterial({
+          color: f.welded ? '#00e5ff' : '#4b5563',
+          emissive: f.welded ? '#00b0ff' : '#000000',
+          emissiveIntensity: f.welded ? 0.8 : 0,
+          metalness: 0.9
+        });
         const sphereStart = new THREE.Mesh(sphereGeo, sphereMat);
         const sphereEnd = new THREE.Mesh(sphereGeo, sphereMat);
         sphereStart.position.set(-distance / 2, 0, 0);
         sphereEnd.position.set(distance / 2, 0, 0);
         group.add(sphereStart, sphereEnd);
+
+        if (f.welded) {
+          const weldRingGeo = new THREE.TorusGeometry(radius * 1.5, radius * 0.35, 8, 16);
+          const weldRingMat = new THREE.MeshStandardMaterial({
+            color: '#00f0ff',
+            emissive: '#00b0ff',
+            emissiveIntensity: 0.9,
+            metalness: 0.9,
+            roughness: 0.2
+          });
+          const ringStart = new THREE.Mesh(weldRingGeo, weldRingMat);
+          const ringEnd = new THREE.Mesh(weldRingGeo, weldRingMat);
+          ringStart.position.set(-distance / 2 + 0.1, 0, 0);
+          ringStart.rotation.y = Math.PI / 2;
+          ringEnd.position.set(distance / 2 - 0.1, 0, 0);
+          ringEnd.rotation.y = Math.PI / 2;
+          group.add(ringStart, ringEnd);
+        }
 
         scene.add(group);
         frameMeshes.set(f.id, group);
@@ -2192,6 +2424,20 @@ const buildThreeMeshes = () => {
           const center = new THREE.Vector3().addVectors(startVec, endVec).multiplyScalar(0.5);
           const centerOfMass = center.clone().addScaledVector(localY, height / 2);
           wallMesh.position.copy(centerOfMass);
+
+          if (w.welded) {
+            const seamGeo = new THREE.BoxGeometry(width, 0.08, 0.22);
+            const seamMat = new THREE.MeshStandardMaterial({
+              color: '#00e5ff',
+              emissive: '#00b0ff',
+              emissiveIntensity: 0.8
+            });
+            const seamTop = new THREE.Mesh(seamGeo, seamMat);
+            seamTop.position.set(0, height / 2, 0);
+            const seamBottom = new THREE.Mesh(seamGeo, seamMat);
+            seamBottom.position.set(0, -height / 2, 0);
+            wallMesh.add(seamTop, seamBottom);
+          }
 
           // --- Dynamic Crack Generation System ---
           // We create a line segment group to represent visual cracks that develop with damage
@@ -2327,6 +2573,70 @@ const buildThreeMeshes = () => {
     let dragStartPos: THREE.Vector3 | null = null;
     let dragCurrentPos: THREE.Vector3 | null = null;
     let activeDrawing = false;
+    let isSelectingBox = false;
+    let selectionBoxStartClient = { x: 0, y: 0 };
+
+    const updateBoxSelection = (startX: number, startY: number, currentX: number, currentY: number) => {
+      const rect = renderer.domElement.getBoundingClientRect();
+      const minX = Math.min(startX, currentX);
+      const maxX = Math.max(startX, currentX);
+      const minY = Math.min(startY, currentY);
+      const maxY = Math.max(startY, currentY);
+
+      const newlySelectedIds: string[] = [];
+
+      // 1. Frames
+      framesRef.current.forEach(f => {
+        const midX = (f.start.x + f.end.x) / 2;
+        const midY = (f.start.y + f.end.y) / 2;
+        const midZ = (f.start.z + f.end.z) / 2;
+        const vec = new THREE.Vector3(midX, midY, midZ);
+        vec.project(camera);
+        
+        const screenX = ((vec.x + 1) * rect.width) / 2 + rect.left;
+        const screenY = (-(vec.y - 1) * rect.height) / 2 + rect.top;
+
+        if (screenX >= minX && screenX <= maxX && screenY >= minY && screenY <= maxY) {
+          newlySelectedIds.push(f.id);
+        }
+      });
+
+      // 2. Walls
+      wallsRef.current.forEach(w => {
+        const midX = (w.start.x + w.end.x) / 2;
+        const midY = (w.start.y + w.end.y) / 2;
+        const midZ = (w.start.z + w.end.z) / 2;
+        const vec = new THREE.Vector3(midX, midY, midZ);
+        vec.project(camera);
+
+        const screenX = ((vec.x + 1) * rect.width) / 2 + rect.left;
+        const screenY = (-(vec.y - 1) * rect.height) / 2 + rect.top;
+
+        if (screenX >= minX && screenX <= maxX && screenY >= minY && screenY <= maxY) {
+          newlySelectedIds.push(w.id);
+        }
+      });
+
+      // 3. Utilities
+      utilitiesRef.current.forEach(u => {
+        const vec = new THREE.Vector3(u.position.x, u.position.y, u.position.z);
+        vec.project(camera);
+
+        const screenX = ((vec.x + 1) * rect.width) / 2 + rect.left;
+        const screenY = (-(vec.y - 1) * rect.height) / 2 + rect.top;
+
+        if (screenX >= minX && screenX <= maxX && screenY >= minY && screenY <= maxY) {
+          newlySelectedIds.push(u.id);
+        }
+      });
+
+      setSelectedDebugIds(newlySelectedIds);
+      if (newlySelectedIds.length > 0) {
+        setSelectedDebugId(newlySelectedIds[newlySelectedIds.length - 1]);
+      } else {
+        setSelectedDebugId(null);
+      }
+    };
     
     // Smooth camera target focal values (keyboard movement state)
     let moveForward = 0;
@@ -2426,6 +2736,357 @@ const buildThreeMeshes = () => {
     const handleMouseDown = (event: MouseEvent) => {
       if (stageRef.current === 'testing') return;
 
+      if (mouseModeRef.current === 'select') {
+        if (event.button === 0) {
+          raycaster.setFromCamera(mouse, camera);
+          const meshesList = [
+            ...Array.from(frameMeshes.values()).flatMap(obj => obj.children),
+            ...Array.from(wallMeshes.values()),
+            ...Array.from(utilityMeshes.values()).flatMap(obj => obj.children)
+          ];
+          const intersects = raycaster.intersectObjects(meshesList, true);
+          if (intersects.length > 0) {
+            let obj: THREE.Object3D | null = intersects[0].object;
+            let foundId: string | null = null;
+            while (obj && obj !== scene) {
+              for (const [id, frameGroup] of frameMeshes.entries()) {
+                if (frameGroup === obj || frameGroup.uuid === obj.uuid || frameGroup.getObjectById(obj.id)) {
+                  foundId = id; break;
+                }
+              }
+              if (foundId) break;
+              for (const [id, wallObj] of wallMeshes.entries()) {
+                if (wallObj === obj || wallObj.uuid === obj.uuid || wallObj.getObjectById(obj.id)) {
+                  foundId = id; break;
+                }
+              }
+              if (foundId) break;
+              for (const [id, utilGroup] of utilityMeshes.entries()) {
+                if (utilGroup === obj || utilGroup.uuid === obj.uuid || utilGroup.getObjectById(obj.id)) {
+                  foundId = id; break;
+                }
+              }
+              if (foundId) break;
+              obj = obj.parent;
+            }
+            if (foundId) {
+              const isMultiSelectModifier = event.shiftKey || event.ctrlKey || event.metaKey;
+              if (isMultiSelectModifier) {
+                setSelectedDebugIds(prev => {
+                  const alreadySelected = prev.includes(foundId!);
+                  if (alreadySelected) {
+                    const next = prev.filter(id => id !== foundId);
+                    setSelectedDebugId(next[next.length - 1] || null);
+                    return next;
+                  } else {
+                    setSelectedDebugId(foundId);
+                    return [...prev, foundId!];
+                  }
+                });
+              } else {
+                setSelectedDebugId(foundId);
+                setSelectedDebugIds([foundId]);
+              }
+            }
+          } else {
+            isSelectingBox = true;
+            selectionBoxStartClient = { x: event.clientX, y: event.clientY };
+            setSelectionBox({
+              show: true,
+              startX: event.clientX,
+              startY: event.clientY,
+              currentX: event.clientX,
+              currentY: event.clientY
+            });
+            const isMultiSelectModifier = event.shiftKey || event.ctrlKey || event.metaKey;
+            if (!isMultiSelectModifier) {
+              setSelectedDebugId(null);
+              setSelectedDebugIds([]);
+            }
+          }
+        }
+        return;
+      }
+
+      if (mouseModeRef.current === 'weld') {
+        if (event.button === 0) {
+          raycaster.setFromCamera(mouse, camera);
+          const meshesList = [
+            ...Array.from(frameMeshes.values()).flatMap(obj => obj.children),
+            ...Array.from(wallMeshes.values()),
+          ];
+          const intersects = raycaster.intersectObjects(meshesList, true);
+          if (intersects.length > 0) {
+            let obj: THREE.Object3D | null = intersects[0].object;
+            let foundId: string | null = null;
+            let foundType: 'frame' | 'wall' | null = null;
+            while (obj && obj !== scene) {
+              for (const [id, frameGroup] of frameMeshes.entries()) {
+                if (frameGroup === obj || frameGroup.uuid === obj.uuid || frameGroup.getObjectById(obj.id)) {
+                  foundId = id; foundType = 'frame'; break;
+                }
+              }
+              if (foundId) break;
+              for (const [id, wallObj] of wallMeshes.entries()) {
+                if (wallObj === obj || wallObj.uuid === obj.uuid || wallObj.getObjectById(obj.id)) {
+                  foundId = id; foundType = 'wall'; break;
+                }
+              }
+              if (foundId) break;
+              obj = obj.parent;
+            }
+
+            if (foundId && foundType) {
+              const hit = intersects[0].point;
+              spawnDebrisParticlesRef.current(hit.x, hit.y, hit.z, 30);
+
+              if (foundType === 'frame') {
+                const frame = framesRef.current.find(f => f.id === foundId);
+                if (frame && onUpdateFrameRef.current) {
+                  onUpdateFrameRef.current({ ...frame, welded: !frame.welded });
+                }
+              } else if (foundType === 'wall') {
+                const wall = wallsRef.current.find(w => w.id === foundId);
+                if (wall && onUpdateWallRef.current) {
+                  onUpdateWallRef.current({ ...wall, welded: !wall.welded });
+                }
+              }
+            }
+          }
+        }
+        return;
+      }
+
+      if (mouseModeRef.current === 'drag') {
+        if (event.button === 0) {
+          if (hoveredGizmoAxis) {
+            isDraggingGizmo = true;
+            activeGizmoAxis = hoveredGizmoAxis.name;
+            dragGizmoStartMousePos.set(event.clientX, event.clientY);
+
+            gizmoPivotPoint.copy(rotationGizmoGroup.position);
+
+            // Save original elements data for multi-element transforms
+            multiOriginalElementsData = {};
+            const targetIds = selectedDebugIdsRef.current.length > 0
+              ? selectedDebugIdsRef.current
+              : (selectedDebugIdRef.current ? [selectedDebugIdRef.current] : []);
+            targetIds.forEach(id => {
+              const frame = framesRef.current.find(f => f.id === id);
+              if (frame) {
+                multiOriginalElementsData[id] = {
+                  type: 'frame',
+                  start: new THREE.Vector3(frame.start.x, frame.start.y, frame.start.z),
+                  end: new THREE.Vector3(frame.end.x, frame.end.y, frame.end.z)
+                };
+              } else {
+                const wall = wallsRef.current.find(w => w.id === id);
+                if (wall) {
+                  multiOriginalElementsData[id] = {
+                    type: 'wall',
+                    start: new THREE.Vector3(wall.start.x, wall.start.y, wall.start.z),
+                    end: new THREE.Vector3(wall.end.x, wall.end.y, wall.end.z),
+                    height: getWallHeight(wall)
+                  };
+                } else {
+                  const util = utilitiesRef.current.find(u => u.id === id);
+                  if (util) {
+                    multiOriginalElementsData[id] = {
+                      type: 'utility',
+                      position: new THREE.Vector3(util.position.x, util.position.y, util.position.z),
+                      rotation: util.rotation !== undefined ? util.rotation : 0,
+                      scale: util.scale !== undefined ? util.scale : 1.0
+                    };
+                  }
+                }
+              }
+            });
+
+            // Save original element data for single-element backward compatibility
+            const targetId = selectedDebugIdRef.current;
+            if (targetId) {
+              const frame = framesRef.current.find(f => f.id === targetId);
+              if (frame) {
+                originalElementData = {
+                  type: 'frame',
+                  start: new THREE.Vector3(frame.start.x, frame.start.y, frame.start.z),
+                  end: new THREE.Vector3(frame.end.x, frame.end.y, frame.end.z)
+                };
+              } else {
+                const wall = wallsRef.current.find(w => w.id === targetId);
+                if (wall) {
+                  originalElementData = {
+                    type: 'wall',
+                    start: new THREE.Vector3(wall.start.x, wall.start.y, wall.start.z),
+                    end: new THREE.Vector3(wall.end.x, wall.end.y, wall.end.z),
+                    height: getWallHeight(wall)
+                  };
+                } else {
+                  const util = utilitiesRef.current.find(u => u.id === targetId);
+                  if (util) {
+                    originalElementData = {
+                      type: 'utility',
+                      position: new THREE.Vector3(util.position.x, util.position.y, util.position.z),
+                      rotation: util.rotation !== undefined ? util.rotation : 0,
+                      scale: util.scale !== undefined ? util.scale : 1.0
+                    };
+                  }
+                }
+              }
+            }
+            return;
+          }
+
+          raycaster.setFromCamera(mouse, camera);
+          const meshesList = [
+            ...Array.from(frameMeshes.values()).flatMap(obj => obj.children),
+            ...Array.from(wallMeshes.values()),
+            ...Array.from(utilityMeshes.values()).flatMap(obj => obj.children)
+          ];
+          const intersects = raycaster.intersectObjects(meshesList, true);
+          if (intersects.length > 0) {
+            let obj: THREE.Object3D | null = intersects[0].object;
+            let foundId: string | null = null;
+            let foundType: 'frame' | 'wall' | 'utility' | null = null;
+            while (obj && obj !== scene) {
+              for (const [id, frameGroup] of frameMeshes.entries()) {
+                if (frameGroup === obj || frameGroup.uuid === obj.uuid || frameGroup.getObjectById(obj.id)) {
+                  foundId = id; foundType = 'frame'; break;
+                }
+              }
+              if (foundId) break;
+              for (const [id, wallObj] of wallMeshes.entries()) {
+                if (wallObj === obj || wallObj.uuid === obj.uuid || wallObj.getObjectById(obj.id)) {
+                  foundId = id; foundType = 'wall'; break;
+                }
+              }
+              if (foundId) break;
+              for (const [id, utilGroup] of utilityMeshes.entries()) {
+                if (utilGroup === obj || utilGroup.uuid === obj.uuid || utilGroup.getObjectById(obj.id)) {
+                  foundId = id; foundType = 'utility'; break;
+                }
+              }
+              if (foundId) break;
+              obj = obj.parent;
+            }
+
+            if (foundId && foundType) {
+              const isMultiSelectModifier = event.shiftKey || event.ctrlKey || event.metaKey;
+              let currentSelection = [...selectedDebugIdsRef.current];
+
+              if (isMultiSelectModifier) {
+                const alreadySelected = currentSelection.includes(foundId);
+                if (alreadySelected) {
+                  currentSelection = currentSelection.filter(id => id !== foundId);
+                  setSelectedDebugId(currentSelection[currentSelection.length - 1] || null);
+                  setSelectedDebugIds(currentSelection);
+                } else {
+                  currentSelection.push(foundId);
+                  setSelectedDebugId(foundId);
+                  setSelectedDebugIds(currentSelection);
+                }
+              } else {
+                if (!currentSelection.includes(foundId)) {
+                  currentSelection = [foundId];
+                  setSelectedDebugId(foundId);
+                  setSelectedDebugIds([foundId]);
+                }
+              }
+
+              isDraggingElement = true;
+              draggedElementId = foundId;
+              draggedElementType = foundType;
+
+              const hit = intersects[0].point;
+              dragElementStartIntersection.copy(hit);
+
+              // Capture multiOriginalElementsData immediately
+              multiOriginalElementsData = {};
+              currentSelection.forEach(id => {
+                const f = framesRef.current.find(item => item.id === id);
+                if (f) {
+                  multiOriginalElementsData[id] = {
+                    type: 'frame',
+                    start: new THREE.Vector3(f.start.x, f.start.y, f.start.z),
+                    end: new THREE.Vector3(f.end.x, f.end.y, f.end.z)
+                  };
+                } else {
+                  const w = wallsRef.current.find(item => item.id === id);
+                  if (w) {
+                    multiOriginalElementsData[id] = {
+                      type: 'wall',
+                      start: new THREE.Vector3(w.start.x, w.start.y, w.start.z),
+                      end: new THREE.Vector3(w.end.x, w.end.y, w.end.z),
+                      height: getWallHeight(w)
+                    };
+                  } else {
+                    const u = utilitiesRef.current.find(item => item.id === id);
+                    if (u) {
+                      multiOriginalElementsData[id] = {
+                        type: 'utility',
+                        position: new THREE.Vector3(u.position.x, u.position.y, u.position.z),
+                        rotation: u.rotation !== undefined ? u.rotation : 0,
+                        scale: u.scale !== undefined ? u.scale : 1.0
+                      };
+                    }
+                  }
+                }
+              });
+
+              if (foundType === 'frame') {
+                const f = framesRef.current.find(item => item.id === foundId);
+                if (f) {
+                  originalElementData = {
+                    type: 'frame',
+                    start: new THREE.Vector3(f.start.x, f.start.y, f.start.z),
+                    end: new THREE.Vector3(f.end.x, f.end.y, f.end.z)
+                  };
+                }
+              } else if (foundType === 'wall') {
+                const w = wallsRef.current.find(item => item.id === foundId);
+                if (w) {
+                  originalElementData = {
+                    type: 'wall',
+                    start: new THREE.Vector3(w.start.x, w.start.y, w.start.z),
+                    end: new THREE.Vector3(w.end.x, w.end.y, w.end.z),
+                    height: getWallHeight(w)
+                  };
+                }
+              } else if (foundType === 'utility') {
+                const u = utilitiesRef.current.find(item => item.id === foundId);
+                if (u) {
+                  originalElementData = {
+                    type: 'utility',
+                    position: new THREE.Vector3(u.position.x, u.position.y, u.position.z),
+                    rotation: u.rotation !== undefined ? u.rotation : 0,
+                    scale: u.scale !== undefined ? u.scale : 1.0
+                  };
+                }
+              }
+              
+              dragElementPlane.setFromNormalAndCoplanarPoint(new THREE.Vector3(0, 1, 0), hit);
+              renderer.domElement.style.cursor = 'grabbing';
+            }
+          } else {
+            isSelectingBox = true;
+            selectionBoxStartClient = { x: event.clientX, y: event.clientY };
+            setSelectionBox({
+              show: true,
+              startX: event.clientX,
+              startY: event.clientY,
+              currentX: event.clientX,
+              currentY: event.clientY
+            });
+            const isMultiSelectModifier = event.shiftKey || event.ctrlKey || event.metaKey;
+            if (!isMultiSelectModifier) {
+              setSelectedDebugId(null);
+              setSelectedDebugIds([]);
+            }
+          }
+        }
+        return;
+      }
+
       const isRotateMode = ['position', 'rotation', 'scale'].includes(mouseModeRef.current);
       if (isRotateMode) {
         if (event.button === 0) {
@@ -2434,7 +3095,45 @@ const buildThreeMeshes = () => {
             activeGizmoAxis = hoveredGizmoAxis.name;
             dragGizmoStartMousePos.set(event.clientX, event.clientY);
 
-            // Save original element data for delta mapping
+            gizmoPivotPoint.copy(rotationGizmoGroup.position);
+
+            // Save original elements data for multi-element transforms
+            multiOriginalElementsData = {};
+            const targetIds = selectedDebugIdsRef.current.length > 0
+              ? selectedDebugIdsRef.current
+              : (selectedDebugIdRef.current ? [selectedDebugIdRef.current] : []);
+            targetIds.forEach(id => {
+              const frame = framesRef.current.find(f => f.id === id);
+              if (frame) {
+                multiOriginalElementsData[id] = {
+                  type: 'frame',
+                  start: new THREE.Vector3(frame.start.x, frame.start.y, frame.start.z),
+                  end: new THREE.Vector3(frame.end.x, frame.end.y, frame.end.z)
+                };
+              } else {
+                const wall = wallsRef.current.find(w => w.id === id);
+                if (wall) {
+                  multiOriginalElementsData[id] = {
+                    type: 'wall',
+                    start: new THREE.Vector3(wall.start.x, wall.start.y, wall.start.z),
+                    end: new THREE.Vector3(wall.end.x, wall.end.y, wall.end.z),
+                    height: getWallHeight(wall)
+                  };
+                } else {
+                  const util = utilitiesRef.current.find(u => u.id === id);
+                  if (util) {
+                    multiOriginalElementsData[id] = {
+                      type: 'utility',
+                      position: new THREE.Vector3(util.position.x, util.position.y, util.position.z),
+                      rotation: util.rotation !== undefined ? util.rotation : 0,
+                      scale: util.scale !== undefined ? util.scale : 1.0
+                    };
+                  }
+                }
+              }
+            });
+
+            // Save original element data for single-element backward compatibility
             const targetId = selectedDebugIdRef.current;
             if (targetId) {
               const frame = framesRef.current.find(f => f.id === targetId);
@@ -2503,7 +3202,24 @@ const buildThreeMeshes = () => {
                 obj = obj.parent;
               }
               if (foundId) {
-                setSelectedDebugId(foundId);
+                const isMultiSelectModifier = event.shiftKey || event.ctrlKey || event.metaKey;
+                if (isMultiSelectModifier) {
+                  setSelectedDebugIds(prev => {
+                    const alreadySelected = prev.includes(foundId!);
+                    if (alreadySelected) {
+                      const next = prev.filter(id => id !== foundId);
+                      setSelectedDebugId(next[next.length - 1] || null);
+                      return next;
+                    } else {
+                      setSelectedDebugId(foundId);
+                      return [...prev, foundId!];
+                    }
+                  });
+                } else {
+                  setSelectedDebugId(foundId);
+                  setSelectedDebugIds([foundId]);
+                }
+
                 // Position gizmo at element's exact center
                 let center = new THREE.Vector3();
                 const frame = framesRef.current.find(f => f.id === foundId);
@@ -2525,9 +3241,21 @@ const buildThreeMeshes = () => {
                 rotationGizmoGroup.visible = true;
               }
             } else {
-              // Clicked on blank space, clear selection
-              setSelectedDebugId(null);
-              rotationGizmoGroup.visible = false;
+              isSelectingBox = true;
+              selectionBoxStartClient = { x: event.clientX, y: event.clientY };
+              setSelectionBox({
+                show: true,
+                startX: event.clientX,
+                startY: event.clientY,
+                currentX: event.clientX,
+                currentY: event.clientY
+              });
+              const isMultiSelectModifier = event.shiftKey || event.ctrlKey || event.metaKey;
+              if (!isMultiSelectModifier) {
+                setSelectedDebugId(null);
+                setSelectedDebugIds([]);
+                rotationGizmoGroup.visible = false;
+              }
             }
           }
         }
@@ -2553,8 +3281,82 @@ const buildThreeMeshes = () => {
 
       raycaster.setFromCamera(mouse, camera);
 
+      if (isSelectingBox) {
+        setSelectionBox(prev => ({
+          ...prev,
+          currentX: event.clientX,
+          currentY: event.clientY
+        }));
+        updateBoxSelection(selectionBoxStartClient.x, selectionBoxStartClient.y, event.clientX, event.clientY);
+        return;
+      }
+
+      // --- D. Direct Element Dragging Logic (Drag Mode) ---
+      if (mouseModeRef.current === 'drag') {
+        if (isDraggingElement && draggedElementId && draggedElementType && originalElementData) {
+          const intersectionPoint = new THREE.Vector3();
+          if (raycaster.ray.intersectPlane(dragElementPlane, intersectionPoint)) {
+            const delta = new THREE.Vector3().subVectors(intersectionPoint, dragElementStartIntersection);
+            
+            if (isAltPressedRef.current) {
+              // Snap to nearest 0.5m
+              delta.x = Math.round(delta.x * 2) / 2;
+              delta.y = Math.round(delta.y * 2) / 2;
+              delta.z = Math.round(delta.z * 2) / 2;
+            }
+
+            Object.keys(multiOriginalElementsData).forEach(id => {
+              const orig = multiOriginalElementsData[id];
+              if (orig.type === 'frame') {
+                const frame = framesRef.current.find(f => f.id === id);
+                if (frame && onUpdateFrameRef.current) {
+                  const updatedFrame = { ...frame };
+                  const start = orig.start;
+                  const end = orig.end;
+                  updatedFrame.start = { x: start.x + delta.x, y: start.y + delta.y, z: start.z + delta.z };
+                  updatedFrame.end = { x: end.x + delta.x, y: end.y + delta.y, z: end.z + delta.z };
+                  onUpdateFrameRef.current(updatedFrame);
+                }
+              } else if (orig.type === 'wall') {
+                const wall = wallsRef.current.find(w => w.id === id);
+                if (wall && onUpdateWallRef.current) {
+                  const updatedWall = { ...wall };
+                  const start = orig.start;
+                  const end = orig.end;
+                  updatedWall.start = { x: start.x + delta.x, y: start.y + delta.y, z: start.z + delta.z };
+                  updatedWall.end = { x: end.x + delta.x, y: end.y + delta.y, z: end.z + delta.z };
+                  onUpdateWallRef.current(updatedWall);
+                }
+              } else if (orig.type === 'utility') {
+                const util = utilitiesRef.current.find(u => u.id === id);
+                if (util && onUpdateUtilityRef.current) {
+                  const updatedUtil = { ...util };
+                  const pos = orig.position;
+                  updatedUtil.position = { x: pos.x + delta.x, y: pos.y + delta.y, z: pos.z + delta.z };
+                  onUpdateUtilityRef.current(updatedUtil);
+                }
+              }
+            });
+          }
+          return;
+        } else {
+          // Hover highlighting cursor for elements in drag mode
+          const meshesList = [
+            ...Array.from(frameMeshes.values()).flatMap(obj => obj.children),
+            ...Array.from(wallMeshes.values()),
+            ...Array.from(utilityMeshes.values()).flatMap(obj => obj.children)
+          ];
+          const intersects = raycaster.intersectObjects(meshesList, true);
+          if (intersects.length > 0) {
+            renderer.domElement.style.cursor = 'grab';
+          } else {
+            renderer.domElement.style.cursor = 'auto';
+          }
+        }
+      }
+
       // --- A. Gizmo Dragging Logic ---
-      if (isDraggingGizmo && originalElementData && activeGizmoAxis) {
+      if (isDraggingGizmo && activeGizmoAxis) {
         const dx = event.clientX - dragGizmoStartMousePos.x;
         const dy = event.clientY - dragGizmoStartMousePos.y;
 
@@ -2564,17 +3366,20 @@ const buildThreeMeshes = () => {
         let deltaY = -dy * dragScale;
         let deltaZ = dy * dragScale;
 
-        const targetId = selectedDebugIdRef.current;
-        if (targetId) {
-          if (originalElementData.type === 'frame') {
-            const frame = framesRef.current.find(f => f.id === targetId);
+        const effectiveMode = (mouseModeRef.current === 'drag' && activeGizmoAxis)
+          ? (activeGizmoAxis.includes('pos') ? 'position' : activeGizmoAxis.includes('rot') ? 'rotation' : 'scale')
+          : mouseModeRef.current;
+
+        Object.keys(multiOriginalElementsData).forEach(id => {
+          const orig = multiOriginalElementsData[id];
+          if (orig.type === 'frame') {
+            const frame = framesRef.current.find(f => f.id === id);
             if (frame && onUpdateFrameRef.current) {
               const updatedFrame = { ...frame };
-              const start = originalElementData.start.clone();
-              const end = originalElementData.end.clone();
-              const center = new THREE.Vector3().addVectors(start, end).multiplyScalar(0.5);
+              const start = orig.start.clone();
+              const end = orig.end.clone();
 
-              if (mouseModeRef.current === 'position') {
+              if (effectiveMode === 'position') {
                 const offset = new THREE.Vector3();
                 if (activeGizmoAxis === "gizmo_pos_x") offset.set(deltaX, 0, 0);
                 if (activeGizmoAxis === "gizmo_pos_y") offset.set(0, deltaY, 0);
@@ -2583,46 +3388,47 @@ const buildThreeMeshes = () => {
                 updatedFrame.start = { x: start.x + offset.x, y: start.y + offset.y, z: start.z + offset.z };
                 updatedFrame.end = { x: end.x + offset.x, y: end.y + offset.y, z: end.z + offset.z };
               } 
-              else if (mouseModeRef.current === 'rotation') {
+              else if (effectiveMode === 'rotation') {
+                let rotMatrix = new THREE.Matrix4();
                 if (activeGizmoAxis === "gizmo_rot_y") {
-                  const angle = dx * 0.015;
-                  const rotMatrix = new THREE.Matrix4().makeRotationY(angle);
-                  
-                  const startRel = start.clone().sub(center).applyMatrix4(rotMatrix).add(center);
-                  const endRel = end.clone().sub(center).applyMatrix4(rotMatrix).add(center);
-
-                  updatedFrame.start = { x: startRel.x, y: startRel.y, z: startRel.z };
-                  updatedFrame.end = { x: endRel.x, y: endRel.y, z: endRel.z };
+                  rotMatrix.makeRotationY(dx * 0.015);
+                } else if (activeGizmoAxis === "gizmo_rot_x") {
+                  rotMatrix.makeRotationX(-dy * 0.015);
+                } else if (activeGizmoAxis === "gizmo_rot_z") {
+                  rotMatrix.makeRotationZ(dx * 0.015);
                 }
+                
+                const startRel = start.clone().sub(gizmoPivotPoint).applyMatrix4(rotMatrix).add(gizmoPivotPoint);
+                const endRel = end.clone().sub(gizmoPivotPoint).applyMatrix4(rotMatrix).add(gizmoPivotPoint);
+
+                updatedFrame.start = { x: startRel.x, y: startRel.y, z: startRel.z };
+                updatedFrame.end = { x: endRel.x, y: endRel.y, z: endRel.z };
               } 
-              else if (mouseModeRef.current === 'scale') {
+              else if (effectiveMode === 'scale') {
                 let scaleFactor = 1.0;
                 if (activeGizmoAxis === "gizmo_scale_x" || activeGizmoAxis === "gizmo_scale_z") scaleFactor = 1.0 + dx * 0.01;
                 if (activeGizmoAxis === "gizmo_scale_y") scaleFactor = 1.0 + deltaY * 0.1;
                 
                 scaleFactor = Math.max(0.2, scaleFactor);
 
-                const startRel = start.clone().sub(center).multiplyScalar(scaleFactor).add(center);
-                const endRel = end.clone().sub(center).multiplyScalar(scaleFactor).add(center);
+                const startRel = start.clone().sub(gizmoPivotPoint).multiplyScalar(scaleFactor).add(gizmoPivotPoint);
+                const endRel = end.clone().sub(gizmoPivotPoint).multiplyScalar(scaleFactor).add(gizmoPivotPoint);
 
                 updatedFrame.start = { x: startRel.x, y: startRel.y, z: startRel.z };
                 updatedFrame.end = { x: endRel.x, y: endRel.y, z: endRel.z };
               }
 
               onUpdateFrameRef.current(updatedFrame);
-              const newCenter = new THREE.Vector3(updatedFrame.start.x + updatedFrame.end.x, updatedFrame.start.y + updatedFrame.end.y, updatedFrame.start.z + updatedFrame.end.z).multiplyScalar(0.5);
-              rotationGizmoGroup.position.copy(newCenter);
             }
           } 
-          else if (originalElementData.type === 'wall') {
-            const wall = wallsRef.current.find(w => w.id === targetId);
+          else if (orig.type === 'wall') {
+            const wall = wallsRef.current.find(w => w.id === id);
             if (wall && onUpdateWallRef.current) {
               const updatedWall = { ...wall };
-              const start = originalElementData.start.clone();
-              const end = originalElementData.end.clone();
-              const center = new THREE.Vector3().addVectors(start, end).multiplyScalar(0.5);
+              const start = orig.start.clone();
+              const end = orig.end.clone();
 
-              if (mouseModeRef.current === 'position') {
+              if (effectiveMode === 'position') {
                 const offset = new THREE.Vector3();
                 if (activeGizmoAxis === "gizmo_pos_x") offset.set(deltaX, 0, 0);
                 if (activeGizmoAxis === "gizmo_pos_y") offset.set(0, deltaY, 0);
@@ -2631,45 +3437,46 @@ const buildThreeMeshes = () => {
                 updatedWall.start = { x: start.x + offset.x, y: start.y + offset.y, z: start.z + offset.z };
                 updatedWall.end = { x: end.x + offset.x, y: end.y + offset.y, z: end.z + offset.z };
               } 
-              else if (mouseModeRef.current === 'rotation') {
+              else if (effectiveMode === 'rotation') {
+                let rotMatrix = new THREE.Matrix4();
                 if (activeGizmoAxis === "gizmo_rot_y") {
-                  const angle = dx * 0.015;
-                  const rotMatrix = new THREE.Matrix4().makeRotationY(angle);
-                  
-                  const startRel = start.clone().sub(center).applyMatrix4(rotMatrix).add(center);
-                  const endRel = end.clone().sub(center).applyMatrix4(rotMatrix).add(center);
-
-                  updatedWall.start = { x: startRel.x, y: startRel.y, z: startRel.z };
-                  updatedWall.end = { x: endRel.x, y: endRel.y, z: endRel.z };
+                  rotMatrix.makeRotationY(dx * 0.015);
+                } else if (activeGizmoAxis === "gizmo_rot_x") {
+                  rotMatrix.makeRotationX(-dy * 0.015);
+                } else if (activeGizmoAxis === "gizmo_rot_z") {
+                  rotMatrix.makeRotationZ(dx * 0.015);
                 }
+                
+                const startRel = start.clone().sub(gizmoPivotPoint).applyMatrix4(rotMatrix).add(gizmoPivotPoint);
+                const endRel = end.clone().sub(gizmoPivotPoint).applyMatrix4(rotMatrix).add(gizmoPivotPoint);
+
+                updatedWall.start = { x: startRel.x, y: startRel.y, z: startRel.z };
+                updatedWall.end = { x: endRel.x, y: endRel.y, z: endRel.z };
               } 
-              else if (mouseModeRef.current === 'scale') {
+              else if (effectiveMode === 'scale') {
                 if (activeGizmoAxis === "gizmo_scale_x" || activeGizmoAxis === "gizmo_scale_z") {
                   const scaleFactor = Math.max(0.2, 1.0 + dx * 0.01);
-                  const startRel = start.clone().sub(center).multiplyScalar(scaleFactor).add(center);
-                  const endRel = end.clone().sub(center).multiplyScalar(scaleFactor).add(center);
+                  const startRel = start.clone().sub(gizmoPivotPoint).multiplyScalar(scaleFactor).add(gizmoPivotPoint);
+                  const endRel = end.clone().sub(gizmoPivotPoint).multiplyScalar(scaleFactor).add(gizmoPivotPoint);
 
                   updatedWall.start = { x: startRel.x, y: startRel.y, z: startRel.z };
                   updatedWall.end = { x: endRel.x, y: endRel.y, z: endRel.z };
                 }
                 if (activeGizmoAxis === "gizmo_scale_y") {
-                  updatedWall.height = Math.max(0.5, originalElementData.height + deltaY);
+                  updatedWall.height = Math.max(0.5, orig.height + deltaY);
                 }
               }
 
               onUpdateWallRef.current(updatedWall);
-              const newCenter = new THREE.Vector3(updatedWall.start.x + updatedWall.end.x, updatedWall.start.y + updatedWall.end.y, updatedWall.start.z + updatedWall.end.z).multiplyScalar(0.5);
-              newCenter.y += getWallHeight(updatedWall) / 2;
-              rotationGizmoGroup.position.copy(newCenter);
             }
           } 
-          else if (originalElementData.type === 'utility') {
-            const util = utilitiesRef.current.find(u => u.id === targetId);
+          else if (orig.type === 'utility') {
+            const util = utilitiesRef.current.find(u => u.id === id);
             if (util && onUpdateUtilityRef.current) {
               const updatedUtil = { ...util };
-              const pos = originalElementData.position.clone();
+              const pos = orig.position.clone();
 
-              if (mouseModeRef.current === 'position') {
+              if (effectiveMode === 'position') {
                 const offset = new THREE.Vector3();
                 if (activeGizmoAxis === "gizmo_pos_x") offset.set(deltaX, 0, 0);
                 if (activeGizmoAxis === "gizmo_pos_y") offset.set(0, deltaY, 0);
@@ -2677,33 +3484,79 @@ const buildThreeMeshes = () => {
 
                 updatedUtil.position = { x: pos.x + offset.x, y: pos.y + offset.y, z: pos.z + offset.z };
               } 
-              else if (mouseModeRef.current === 'rotation') {
+              else if (effectiveMode === 'rotation') {
+                let angle = 0;
+                let rotMatrix = new THREE.Matrix4();
                 if (activeGizmoAxis === "gizmo_rot_y") {
-                  const initialRot = originalElementData.rotation !== undefined ? originalElementData.rotation : 0;
-                  const angle = initialRot + dx * 0.015;
-                  updatedUtil.rotation = angle;
+                  angle = dx * 0.015;
+                  rotMatrix.makeRotationY(angle);
+                } else if (activeGizmoAxis === "gizmo_rot_x") {
+                  angle = -dy * 0.015;
+                  rotMatrix.makeRotationX(angle);
+                } else if (activeGizmoAxis === "gizmo_rot_z") {
+                  angle = dx * 0.015;
+                  rotMatrix.makeRotationZ(angle);
+                }
+
+                const posRel = pos.clone().sub(gizmoPivotPoint).applyMatrix4(rotMatrix).add(gizmoPivotPoint);
+                updatedUtil.position = { x: posRel.x, y: posRel.y, z: posRel.z };
+
+                if (activeGizmoAxis === "gizmo_rot_y") {
+                  const initialRot = orig.rotation !== undefined ? orig.rotation : 0;
+                  updatedUtil.rotation = initialRot + angle;
                 }
               } 
-              else if (mouseModeRef.current === 'scale') {
-                let scaleFactor = originalElementData.scale !== undefined ? originalElementData.scale : 1.0;
+              else if (effectiveMode === 'scale') {
+                let scaleFactor = 1.0;
                 if (activeGizmoAxis === "gizmo_scale_x" || activeGizmoAxis === "gizmo_scale_z") {
-                  scaleFactor = scaleFactor + dx * 0.01;
+                  scaleFactor = 1.0 + dx * 0.01;
                 } else if (activeGizmoAxis === "gizmo_scale_y") {
-                  scaleFactor = scaleFactor + deltaY * 0.1;
+                  scaleFactor = 1.0 + deltaY * 0.1;
                 }
-                updatedUtil.scale = Math.max(0.2, scaleFactor);
+                scaleFactor = Math.max(0.2, scaleFactor);
+
+                const posRel = pos.clone().sub(gizmoPivotPoint).multiplyScalar(scaleFactor).add(gizmoPivotPoint);
+                updatedUtil.position = { x: posRel.x, y: posRel.y, z: posRel.z };
+
+                const origScale = orig.scale !== undefined ? orig.scale : 1.0;
+                updatedUtil.scale = Math.max(0.2, origScale * scaleFactor);
               }
 
               onUpdateUtilityRef.current(updatedUtil);
-              rotationGizmoGroup.position.set(updatedUtil.position.x, updatedUtil.position.y, updatedUtil.position.z);
             }
+          }
+        });
+
+        // Keep position synchronized to the selection center
+        if (selectedDebugIdsRef.current.length > 1) {
+          rotationGizmoGroup.position.copy(getMultiSelectionCenter());
+        } else {
+          const targetId = selectedDebugIdRef.current || selectedDebugIdsRef.current[0];
+          if (targetId) {
+            let newCenter = new THREE.Vector3();
+            const frame = framesRef.current.find(f => f.id === targetId);
+            if (frame) {
+              newCenter.addVectors(new THREE.Vector3(frame.start.x, frame.start.y, frame.start.z), new THREE.Vector3(frame.end.x, frame.end.y, frame.end.z)).multiplyScalar(0.5);
+            } else {
+              const wall = wallsRef.current.find(w => w.id === targetId);
+              if (wall) {
+                newCenter.addVectors(new THREE.Vector3(wall.start.x, wall.start.y, wall.start.z), new THREE.Vector3(wall.end.x, wall.end.y, wall.end.z)).multiplyScalar(0.5);
+                newCenter.y += getWallHeight(wall) / 2;
+              } else {
+                const util = utilitiesRef.current.find(u => u.id === targetId);
+                if (util) {
+                  newCenter.set(util.position.x, util.position.y, util.position.z);
+                }
+              }
+            }
+            rotationGizmoGroup.position.copy(newCenter);
           }
         }
         return;
       }
 
       // --- B. Gizmo Hover Highlight Logic ---
-      const isRotateMode = ['position', 'rotation', 'scale'].includes(mouseModeRef.current);
+      const isRotateMode = ['position', 'rotation', 'scale', 'drag'].includes(mouseModeRef.current);
       if (isRotateMode && !isDraggingGizmo) {
         // Reset colors and opacities
         (tArrowX.line.material as any).color.setHex(0xef4444);
@@ -3000,6 +3853,22 @@ const buildThreeMeshes = () => {
     const handleMouseUp = (event: MouseEvent) => {
       if (stageRef.current === 'testing') return;
 
+      if (isSelectingBox) {
+        isSelectingBox = false;
+        setSelectionBox(prev => ({ ...prev, show: false }));
+        return;
+      }
+
+      if (mouseModeRef.current === 'drag') {
+        if (isDraggingElement) {
+          isDraggingElement = false;
+          draggedElementId = null;
+          draggedElementType = null;
+          renderer.domElement.style.cursor = 'auto';
+        }
+        return;
+      }
+
       if (isDraggingGizmo) {
         isDraggingGizmo = false;
         activeGizmoAxis = null;
@@ -3205,9 +4074,72 @@ const buildThreeMeshes = () => {
     window.addEventListener('keydown', handleKeyDownWASD);
     window.addEventListener('keyup', handleKeyUpWASD);
 
-    // Disable default context menu
-    const disableContextMenu = (e: MouseEvent) => e.preventDefault();
-    dom.addEventListener('contextmenu', disableContextMenu);
+    // Custom context menu event handler
+    const handleContextMenuEvent = (event: MouseEvent) => {
+      event.preventDefault();
+      if (stageRef.current === 'testing') return;
+
+      const rect = renderer.domElement.getBoundingClientRect();
+      mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+      raycaster.setFromCamera(mouse, camera);
+
+      // Raycast against elements
+      const meshesList = [
+        ...Array.from(frameMeshes.values()).flatMap(obj => obj.children),
+        ...Array.from(wallMeshes.values()),
+        ...Array.from(utilityMeshes.values()).flatMap(obj => obj.children)
+      ];
+      const intersects = raycaster.intersectObjects(meshesList, true);
+
+      let foundId: string | null = null;
+      let foundType: 'frame' | 'wall' | 'utility' | null = null;
+      let hitPoint: { x: number; y: number; z: number } | null = null;
+
+      if (intersects.length > 0) {
+        hitPoint = { x: intersects[0].point.x, y: intersects[0].point.y, z: intersects[0].point.z };
+        let obj: THREE.Object3D | null = intersects[0].object;
+        while (obj && obj !== scene) {
+          for (const [id, frameGroup] of frameMeshes.entries()) {
+            if (frameGroup === obj || frameGroup.uuid === obj.uuid || frameGroup.getObjectById(obj.id)) {
+              foundId = id; foundType = 'frame'; break;
+            }
+          }
+          if (foundId) break;
+          for (const [id, wallObj] of wallMeshes.entries()) {
+            if (wallObj === obj || wallObj.uuid === obj.uuid || wallObj.getObjectById(obj.id)) {
+              foundId = id; foundType = 'wall'; break;
+            }
+          }
+          if (foundId) break;
+          for (const [id, utilGroup] of utilityMeshes.entries()) {
+            if (utilGroup === obj || utilGroup.uuid === obj.uuid || utilGroup.getObjectById(obj.id)) {
+              foundId = id; foundType = 'utility'; break;
+            }
+          }
+          if (foundId) break;
+          obj = obj.parent;
+        }
+      }
+
+      // If we didn't hit an element, get grid/ground point
+      if (!foundId) {
+        const gridIntersection = getGridIntersection(event);
+        if (gridIntersection) {
+          hitPoint = { x: gridIntersection.x, y: gridIntersection.y, z: gridIntersection.z };
+        }
+      }
+
+      setContextMenu({
+        show: true,
+        x: event.clientX,
+        y: event.clientY,
+        targetId: foundId,
+        targetType: foundType,
+        hitPoint: hitPoint
+      });
+    };
+    dom.addEventListener('contextmenu', handleContextMenuEvent);
 
     // --- 9. Real-time Render & Physics Animation Loop ---
     let frameId: number;
@@ -4709,9 +5641,9 @@ const buildThreeMeshes = () => {
       }
       cloudGroup.children.forEach((cloud) => {
         cloud.position.x += 0.012;
-        if (cloud.position.x > 35) {
-          cloud.position.x = -35;
-          cloud.position.z = (Math.random() - 0.5) * 70;
+        if (cloud.position.x > 75) {
+          cloud.position.x = -75;
+          cloud.position.z = (Math.random() - 0.5) * 100;
         }
       });
       
@@ -4865,29 +5797,60 @@ const buildThreeMeshes = () => {
       }
 
       const activeMode = mouseModeRef.current;
-      const isRotateMode = ['position', 'rotation', 'scale'].includes(activeMode);
-      if (!isRotateMode) {
+      const isRotateMode = ['position', 'rotation', 'scale', 'drag'].includes(activeMode);
+      const hasSelection = selectedDebugIdsRef.current.length > 0 || selectedDebugIdRef.current !== null;
+      if (!isRotateMode || !hasSelection) {
         rotationGizmoGroup.visible = false;
       } else {
-        tArrowX.visible = activeMode === 'position';
-        tArrowY.visible = activeMode === 'position';
-        tArrowZ.visible = activeMode === 'position';
+        rotationGizmoGroup.visible = true;
 
-        rRingX.visible = activeMode === 'rotation';
-        rRingY.visible = activeMode === 'rotation';
-        rRingZ.visible = activeMode === 'rotation';
+        tArrowX.visible = activeMode === 'position' || activeMode === 'drag';
+        tArrowY.visible = activeMode === 'position' || activeMode === 'drag';
+        tArrowZ.visible = activeMode === 'position' || activeMode === 'drag';
 
-        sLineX.visible = activeMode === 'scale';
-        sBoxMeshX.visible = activeMode === 'scale';
-        sLineY.visible = activeMode === 'scale';
-        sBoxMeshY.visible = activeMode === 'scale';
-        sLineZ.visible = activeMode === 'scale';
-        sBoxMeshZ.visible = activeMode === 'scale';
+        rRingX.visible = activeMode === 'rotation' || activeMode === 'drag';
+        rRingY.visible = activeMode === 'rotation' || activeMode === 'drag';
+        rRingZ.visible = activeMode === 'rotation' || activeMode === 'drag';
 
-        if (activeMode === 'rotation') {
+        sLineX.visible = activeMode === 'scale' || activeMode === 'drag';
+        sBoxMeshX.visible = activeMode === 'scale' || activeMode === 'drag';
+        sLineY.visible = activeMode === 'scale' || activeMode === 'drag';
+        sBoxMeshY.visible = activeMode === 'scale' || activeMode === 'drag';
+        sLineZ.visible = activeMode === 'scale' || activeMode === 'drag';
+        sBoxMeshZ.visible = activeMode === 'scale' || activeMode === 'drag';
+
+        if (activeMode === 'rotation' || activeMode === 'drag') {
           rRingX.rotation.z += 0.005;
           rRingY.rotation.z += 0.005;
           rRingZ.rotation.z += 0.005;
+        }
+
+        // Keep position synchronized if not actively dragging the gizmo or element
+        if (!isDraggingGizmo && !isDraggingElement) {
+          if (selectedDebugIdsRef.current.length > 1) {
+            rotationGizmoGroup.position.copy(getMultiSelectionCenter());
+          } else {
+            const targetId = selectedDebugIdRef.current || selectedDebugIdsRef.current[0];
+            if (targetId) {
+              let center = new THREE.Vector3();
+              const frame = framesRef.current.find(f => f.id === targetId);
+              if (frame) {
+                center.addVectors(new THREE.Vector3(frame.start.x, frame.start.y, frame.start.z), new THREE.Vector3(frame.end.x, frame.end.y, frame.end.z)).multiplyScalar(0.5);
+              } else {
+                const wall = wallsRef.current.find(w => w.id === targetId);
+                if (wall) {
+                  center.addVectors(new THREE.Vector3(wall.start.x, wall.start.y, wall.start.z), new THREE.Vector3(wall.end.x, wall.end.y, wall.end.z)).multiplyScalar(0.5);
+                  center.y += getWallHeight(wall) / 2;
+                } else {
+                  const util = utilitiesRef.current.find(u => u.id === targetId);
+                  if (util) {
+                    center.set(util.position.x, util.position.y, util.position.z);
+                  }
+                }
+              }
+              rotationGizmoGroup.position.copy(center);
+            }
+          }
         }
       }
 
@@ -4942,7 +5905,7 @@ const buildThreeMeshes = () => {
       dom.removeEventListener('mousemove', handleCanvasMouseMove);
       dom.removeEventListener('mouseup', handleCanvasMouseUp);
       dom.removeEventListener('wheel', handleWheel);
-      dom.removeEventListener('contextmenu', disableContextMenu);
+      dom.removeEventListener('contextmenu', handleContextMenuEvent);
       if (mountRef.current && renderer.domElement) {
         mountRef.current.removeChild(renderer.domElement);
       }
@@ -5003,6 +5966,7 @@ const buildThreeMeshes = () => {
         midX,
         midY,
         midZ,
+        raw: f,
       };
     }),
     ...walls.map((w) => {
@@ -5025,6 +5989,7 @@ const buildThreeMeshes = () => {
         midX,
         midY,
         midZ,
+        raw: w,
       };
     }),
     ...utilities.map((u) => {
@@ -5174,6 +6139,17 @@ const buildThreeMeshes = () => {
             <span>설치 모드</span>
           </button>
           <button
+            onClick={() => setMouseMode('drag')}
+            className={`px-3 py-1.5 rounded-md font-bold text-xs flex items-center gap-1.5 transition-all cursor-pointer ${
+              mouseMode === 'drag'
+                ? 'bg-sky-600/95 text-white shadow-sm font-bold border border-sky-400/40'
+                : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800/30'
+            }`}
+          >
+            <Hand className="w-3.5 h-3.5 text-sky-400" />
+            <span>드래그 이동</span>
+          </button>
+          <button
             onClick={() => setMouseMode('position')}
             className={`px-3 py-1.5 rounded-md font-bold text-xs flex items-center gap-1.5 transition-all cursor-pointer ${
               mouseMode === 'position'
@@ -5207,6 +6183,31 @@ const buildThreeMeshes = () => {
             <span>확장 축</span>
             <kbd className="px-1 text-[9px] bg-neutral-800 text-neutral-400 rounded border border-neutral-700 font-mono ml-0.5">
               R
+            </kbd>
+          </button>
+          <button
+            onClick={() => setMouseMode('select')}
+            className={`px-3 py-1.5 rounded-md font-bold text-xs flex items-center gap-1.5 transition-all cursor-pointer ${
+              mouseMode === 'select'
+                ? 'bg-violet-600/95 text-white shadow-sm border border-violet-400/40'
+                : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800/30'
+            }`}
+          >
+            <BoxSelect className="w-3.5 h-3.5 text-violet-400" />
+            <span>다중 선택</span>
+          </button>
+          <button
+            onClick={() => setMouseMode('weld')}
+            className={`px-3 py-1.5 rounded-md font-bold text-xs flex items-center gap-1.5 transition-all cursor-pointer ${
+              mouseMode === 'weld'
+                ? 'bg-cyan-600/95 text-white shadow-sm border border-cyan-300/60 font-bold ring-2 ring-cyan-400/40'
+                : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800/30'
+            }`}
+          >
+            <Sparkles className="w-3.5 h-3.5 text-cyan-300 animate-pulse" />
+            <span>고강도 용접</span>
+            <kbd className="px-1 text-[9px] bg-neutral-800 text-neutral-400 rounded border border-neutral-700 font-mono ml-0.5">
+              E
             </kbd>
           </button>
         </div>
@@ -5445,6 +6446,32 @@ const buildThreeMeshes = () => {
 
                     {/* Action Buttons */}
                     <div className="flex items-center justify-end gap-1.5 pt-1 border-t border-neutral-800/80">
+                      {(item.type === 'frame' || item.type === 'wall') && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (item.type === 'frame') {
+                              const f = framesRef.current.find(frame => frame.id === item.id);
+                              if (f && onUpdateFrameRef.current) {
+                                onUpdateFrameRef.current({ ...f, welded: !f.welded });
+                              }
+                            } else if (item.type === 'wall') {
+                              const w = wallsRef.current.find(wall => wall.id === item.id);
+                              if (w && onUpdateWallRef.current) {
+                                onUpdateWallRef.current({ ...w, welded: !w.welded });
+                              }
+                            }
+                          }}
+                          className={`px-2 py-1 rounded text-[10px] font-medium flex items-center gap-1 transition-colors cursor-pointer ${
+                            item.raw?.welded
+                              ? 'bg-cyan-500 text-black font-bold shadow-sm'
+                              : 'bg-neutral-800 hover:bg-neutral-700 text-cyan-300 border border-cyan-800/60'
+                          }`}
+                        >
+                          <Sparkles className="w-3 h-3" />
+                          <span>{item.raw?.welded ? '용접됨 (+250%)' : '고강도 용접'}</span>
+                        </button>
+                      )}
                       <button
                         onClick={(e) => {
                           e.stopPropagation();
@@ -5521,6 +6548,19 @@ const buildThreeMeshes = () => {
         >
           <Navigation className="w-5 h-5 fill-amber-400/20" style={{ transform: 'rotate(90deg)' }} />
         </div>
+
+        {/* Dynamic Drag Multi-Selection Box */}
+        {selectionBox.show && (
+          <div
+            className="absolute border border-dashed border-indigo-500 bg-indigo-500/10 pointer-events-none z-30"
+            style={{
+              left: Math.min(selectionBox.startX, selectionBox.currentX),
+              top: Math.min(selectionBox.startY, selectionBox.currentY),
+              width: Math.abs(selectionBox.startX - selectionBox.currentX),
+              height: Math.abs(selectionBox.startY - selectionBox.currentY),
+            }}
+          />
+        )}
       </div>
 
       {/* Render Dynamic Tooltip / Hover Spec Box */}
@@ -5574,6 +6614,473 @@ const buildThreeMeshes = () => {
           </div>
         )}
       </div>
+
+      {/* Context Menu Overlay */}
+      {contextMenu.show && (
+        <div
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          className="absolute z-50 min-w-[170px] bg-neutral-900/95 border border-neutral-700/80 rounded-xl py-1.5 shadow-2xl backdrop-blur-md text-xs font-medium text-neutral-200 animate-in fade-in zoom-in-95 duration-100"
+          onMouseDown={(e) => e.stopPropagation()} // Prevent closing on mousedown within the menu
+        >
+          {/* Target Info Header */}
+          <div className="px-3 py-1.5 text-[10px] text-neutral-400 font-mono border-b border-neutral-800 mb-1">
+            {contextMenu.targetType ? (
+              <span className="flex items-center gap-1.5">
+                <span className="w-1.5 h-1.5 rounded-full bg-indigo-500" />
+                {contextMenu.targetType === 'frame' ? '뼈대 구조물' : contextMenu.targetType === 'wall' ? '외벽 구조물' : '보강 설비'} 선택됨
+              </span>
+            ) : (
+              <span className="flex items-center gap-1.5">
+                <span className="w-1.5 h-1.5 rounded-full bg-neutral-600" />
+                지면 / 격자 포인트
+              </span>
+            )}
+          </div>
+
+          {/* Copy Option (Requires active target) */}
+          {contextMenu.targetId && (
+            <button
+              onClick={() => {
+                const ids = selectedDebugIdsRef.current;
+                const itemsToCopy: Array<{ type: 'frame' | 'wall' | 'utility', data: any }> = [];
+
+                if (ids.includes(contextMenu.targetId!)) {
+                  ids.forEach(id => {
+                    const f = framesRef.current.find(item => item.id === id);
+                    if (f) itemsToCopy.push({ type: 'frame', data: JSON.parse(JSON.stringify(f)) });
+                    const w = wallsRef.current.find(item => item.id === id);
+                    if (w) itemsToCopy.push({ type: 'wall', data: JSON.parse(JSON.stringify(w)) });
+                    const u = utilitiesRef.current.find(item => item.id === id);
+                    if (u) itemsToCopy.push({ type: 'utility', data: JSON.parse(JSON.stringify(u)) });
+                  });
+                } else {
+                  const id = contextMenu.targetId!;
+                  const type = contextMenu.targetType!;
+                  let data: any = null;
+                  if (type === 'frame') {
+                    const f = framesRef.current.find(item => item.id === id);
+                    if (f) data = JSON.parse(JSON.stringify(f));
+                  } else if (type === 'wall') {
+                    const w = wallsRef.current.find(item => item.id === id);
+                    if (w) data = JSON.parse(JSON.stringify(w));
+                  } else if (type === 'utility') {
+                    const u = utilitiesRef.current.find(item => item.id === id);
+                    if (u) data = JSON.parse(JSON.stringify(u));
+                  }
+                  if (data) itemsToCopy.push({ type, data });
+                }
+
+                if (itemsToCopy.length > 0) {
+                  setCopiedElements(itemsToCopy);
+                  setCopiedElement(itemsToCopy[0]); // fallback
+                  setCopyNotification(`${itemsToCopy.length}개 개체 복사 완료!`);
+                  setTimeout(() => setCopyNotification(null), 2000);
+                }
+                setContextMenu(prev => ({ ...prev, show: false }));
+              }}
+              className="w-full text-left px-3 py-2 hover:bg-neutral-800/80 hover:text-white flex items-center gap-2 cursor-pointer transition-colors"
+            >
+              <Copy className="w-3.5 h-3.5 text-neutral-400" />
+              <span>복사 (Copy)</span>
+            </button>
+          )}
+
+          {/* Paste Option (Requires copied elements and valid hitPoint) */}
+          <button
+            onClick={() => {
+              if (copiedElements.length > 0 && contextMenu.hitPoint) {
+                const hp = contextMenu.hitPoint;
+                let totalCenter = new THREE.Vector3();
+                let count = 0;
+
+                copiedElements.forEach(item => {
+                  if (item.type === 'frame' || item.type === 'wall') {
+                    const s = new THREE.Vector3(item.data.start.x, item.data.start.y, item.data.start.z);
+                    const e = new THREE.Vector3(item.data.end.x, item.data.end.y, item.data.end.z);
+                    totalCenter.add(new THREE.Vector3().addVectors(s, e).multiplyScalar(0.5));
+                    count++;
+                  } else if (item.type === 'utility') {
+                    totalCenter.add(new THREE.Vector3(item.data.position.x, item.data.position.y, item.data.position.z));
+                    count++;
+                  }
+                });
+
+                if (count > 0) {
+                  totalCenter.divideScalar(count);
+                } else {
+                  totalCenter.copy(hp);
+                }
+
+                const pastedIds: string[] = [];
+                copiedElements.forEach(item => {
+                  const type = item.type;
+                  const originalData = item.data;
+                  const newId = Math.random().toString(36).substring(2, 9);
+                  pastedIds.push(newId);
+
+                  if (type === 'utility') {
+                    const spec = UTILITIES[originalData.type];
+                    const offset = new THREE.Vector3().subVectors(new THREE.Vector3(originalData.position.x, originalData.position.y, originalData.position.z), totalCenter);
+                    onAddUtilityRef.current({
+                      ...originalData,
+                      id: newId,
+                      position: { x: hp.x + offset.x, y: hp.y + offset.y, z: hp.z + offset.z },
+                      cost: spec ? spec.cost : originalData.cost
+                    });
+                  } else if (type === 'frame') {
+                    const startVec = new THREE.Vector3(originalData.start.x, originalData.start.y, originalData.start.z);
+                    const endVec = new THREE.Vector3(originalData.end.x, originalData.end.y, originalData.end.z);
+                    const itemCenter = new THREE.Vector3().addVectors(startVec, endVec).multiplyScalar(0.5);
+                    const centerOffset = new THREE.Vector3().subVectors(itemCenter, totalCenter);
+
+                    const finalCenter = new THREE.Vector3().addVectors(hp, centerOffset);
+                    const halfSpan = new THREE.Vector3().subVectors(endVec, startVec).multiplyScalar(0.5);
+
+                    onAddFrameRef.current({
+                      ...originalData,
+                      id: newId,
+                      start: { x: finalCenter.x - halfSpan.x, y: finalCenter.y - halfSpan.y, z: finalCenter.z - halfSpan.z },
+                      end: { x: finalCenter.x + halfSpan.x, y: finalCenter.y + halfSpan.y, z: finalCenter.z + halfSpan.z }
+                    });
+                  } else if (type === 'wall') {
+                    const startVec = new THREE.Vector3(originalData.start.x, originalData.start.y, originalData.start.z);
+                    const endVec = new THREE.Vector3(originalData.end.x, originalData.end.y, originalData.end.z);
+                    const itemCenter = new THREE.Vector3().addVectors(startVec, endVec).multiplyScalar(0.5);
+                    const centerOffset = new THREE.Vector3().subVectors(itemCenter, totalCenter);
+
+                    const finalCenter = new THREE.Vector3().addVectors(hp, centerOffset);
+                    const halfSpan = new THREE.Vector3().subVectors(endVec, startVec).multiplyScalar(0.5);
+
+                    onAddWallRef.current({
+                      ...originalData,
+                      id: newId,
+                      start: { x: finalCenter.x - halfSpan.x, y: finalCenter.y - halfSpan.y, z: finalCenter.z - halfSpan.z },
+                      end: { x: finalCenter.x + halfSpan.x, y: finalCenter.y + halfSpan.y, z: finalCenter.z + halfSpan.z }
+                    });
+                  }
+                });
+
+                setSelectedDebugIds(pastedIds);
+                setSelectedDebugId(pastedIds[pastedIds.length - 1] || null);
+              }
+              setContextMenu(prev => ({ ...prev, show: false }));
+            }}
+            disabled={copiedElements.length === 0 || !contextMenu.hitPoint}
+            className={`w-full text-left px-3 py-2 flex items-center gap-2 cursor-pointer transition-colors ${
+              copiedElements.length > 0 && contextMenu.hitPoint
+                ? 'hover:bg-neutral-800/80 hover:text-white text-neutral-200'
+                : 'text-neutral-600 cursor-not-allowed opacity-50'
+            }`}
+          >
+            <Box className="w-3.5 h-3.5 text-neutral-400" />
+            <span>붙여넣기 (Paste)</span>
+          </button>
+
+          {/* Duplicate Option (Requires active target) */}
+          {contextMenu.targetId && (
+            <button
+              onClick={() => {
+                const ids = selectedDebugIdsRef.current;
+                const targetId = contextMenu.targetId!;
+                const duplicatedIds: string[] = [];
+
+                if (ids.includes(targetId)) {
+                  ids.forEach(id => {
+                    const newId = Math.random().toString(36).substring(2, 9);
+                    duplicatedIds.push(newId);
+
+                    const frame = framesRef.current.find(item => item.id === id);
+                    if (frame) {
+                      onAddFrameRef.current({
+                        ...frame,
+                        id: newId,
+                        start: { x: frame.start.x + 1.0, y: frame.start.y, z: frame.start.z + 1.0 },
+                        end: { x: frame.end.x + 1.0, y: frame.end.y, z: frame.end.z + 1.0 }
+                      });
+                    } else {
+                      const wall = wallsRef.current.find(item => item.id === id);
+                      if (wall) {
+                        onAddWallRef.current({
+                          ...wall,
+                          id: newId,
+                          start: { x: wall.start.x + 1.0, y: wall.start.y, z: wall.start.z + 1.0 },
+                          end: { x: wall.end.x + 1.0, y: wall.end.y, z: wall.end.z + 1.0 }
+                        });
+                      } else {
+                        const util = utilitiesRef.current.find(item => item.id === id);
+                        if (util) {
+                          onAddUtilityRef.current({
+                            ...util,
+                            id: newId,
+                            position: { x: util.position.x + 1.0, y: util.position.y, z: util.position.z + 1.0 }
+                          });
+                        }
+                      }
+                    }
+                  });
+                  setSelectedDebugIds(duplicatedIds);
+                  setSelectedDebugId(duplicatedIds[duplicatedIds.length - 1] || null);
+                } else {
+                  const id = contextMenu.targetId!;
+                  const type = contextMenu.targetType!;
+                  const newId = Math.random().toString(36).substring(2, 9);
+
+                  if (type === 'frame') {
+                    const frame = framesRef.current.find(item => item.id === id);
+                    if (frame) {
+                      onAddFrameRef.current({
+                        ...frame,
+                        id: newId,
+                        start: { x: frame.start.x + 1.0, y: frame.start.y, z: frame.start.z + 1.0 },
+                        end: { x: frame.end.x + 1.0, y: frame.end.y, z: frame.end.z + 1.0 }
+                      });
+                      setSelectedDebugId(newId);
+                      setSelectedDebugIds([newId]);
+                    }
+                  } else if (type === 'wall') {
+                    const wall = wallsRef.current.find(item => item.id === id);
+                    if (wall) {
+                      onAddWallRef.current({
+                        ...wall,
+                        id: newId,
+                        start: { x: wall.start.x + 1.0, y: wall.start.y, z: wall.start.z + 1.0 },
+                        end: { x: wall.end.x + 1.0, y: wall.end.y, z: wall.end.z + 1.0 }
+                      });
+                      setSelectedDebugId(newId);
+                      setSelectedDebugIds([newId]);
+                    }
+                  } else if (type === 'utility') {
+                    const util = utilitiesRef.current.find(item => item.id === id);
+                    if (util) {
+                      onAddUtilityRef.current({
+                        ...util,
+                        id: newId,
+                        position: { x: util.position.x + 1.0, y: util.position.y, z: util.position.z + 1.0 }
+                      });
+                      setSelectedDebugId(newId);
+                      setSelectedDebugIds([newId]);
+                    }
+                  }
+                }
+                setContextMenu(prev => ({ ...prev, show: false }));
+              }}
+              className="w-full text-left px-3 py-2 hover:bg-neutral-800/80 hover:text-white flex items-center gap-2 cursor-pointer transition-colors"
+            >
+              <RotateCw className="w-3.5 h-3.5 text-neutral-400" />
+              <span>복제 (Duplicate)</span>
+            </button>
+          )}
+
+          {/* Weld Option (Requires active target) */}
+          {contextMenu.targetId && (contextMenu.targetType === 'frame' || contextMenu.targetType === 'wall') && (
+            <button
+              onClick={() => {
+                const ids = selectedDebugIdsRef.current;
+                const id = contextMenu.targetId!;
+                const type = contextMenu.targetType!;
+                if (ids.includes(id)) {
+                  ids.forEach(itemId => {
+                    const f = framesRef.current.find(item => item.id === itemId);
+                    if (f && onUpdateFrameRef.current) onUpdateFrameRef.current({ ...f, welded: !f.welded });
+                    const w = wallsRef.current.find(item => item.id === itemId);
+                    if (w && onUpdateWallRef.current) onUpdateWallRef.current({ ...w, welded: !w.welded });
+                  });
+                } else {
+                  if (type === 'frame') {
+                    const f = framesRef.current.find(item => item.id === id);
+                    if (f && onUpdateFrameRef.current) onUpdateFrameRef.current({ ...f, welded: !f.welded });
+                  } else if (type === 'wall') {
+                    const w = wallsRef.current.find(item => item.id === id);
+                    if (w && onUpdateWallRef.current) onUpdateWallRef.current({ ...w, welded: !w.welded });
+                  }
+                }
+                setContextMenu(prev => ({ ...prev, show: false }));
+              }}
+              className="w-full text-left px-3 py-2 hover:bg-neutral-800/80 hover:text-cyan-300 flex items-center gap-2 cursor-pointer transition-colors"
+            >
+              <Sparkles className="w-3.5 h-3.5 text-cyan-400" />
+              <span>고강도 용접 적용/해제</span>
+            </button>
+          )}
+
+          {/* Material / Type Change Submenu (Requires active target) */}
+          {contextMenu.targetId && (
+            <div className="border-t border-neutral-800 my-1 pt-1">
+              <div className="px-3 py-1 text-[9px] text-neutral-500 font-bold uppercase tracking-wider">
+                소재/유형 변경
+              </div>
+
+              {contextMenu.targetType === 'frame' && Object.entries(FRAMEWORK_MATERIALS).map(([matId, spec]) => (
+                <button
+                  key={matId}
+                  onClick={() => {
+                    const ids = selectedDebugIdsRef.current;
+                    const id = contextMenu.targetId!;
+                    if (ids.includes(id)) {
+                      ids.forEach(frameId => {
+                        const f = framesRef.current.find(item => item.id === frameId);
+                        if (f && onUpdateFrameRef.current) {
+                          const startVec = new THREE.Vector3(f.start.x, f.start.y, f.start.z);
+                          const endVec = new THREE.Vector3(f.end.x, f.end.y, f.end.z);
+                          const dist = startVec.distanceTo(endVec);
+                          onUpdateFrameRef.current({
+                            ...f,
+                            material: matId as any,
+                            cost: Math.round(dist * spec.costPerMeter),
+                            weight: dist * spec.density
+                          });
+                        }
+                      });
+                    } else {
+                      const frame = framesRef.current.find(item => item.id === id);
+                      if (frame && onUpdateFrameRef.current) {
+                        const startVec = new THREE.Vector3(frame.start.x, frame.start.y, frame.start.z);
+                        const endVec = new THREE.Vector3(frame.end.x, frame.end.y, frame.end.z);
+                        const dist = startVec.distanceTo(endVec);
+                        onUpdateFrameRef.current({
+                          ...frame,
+                          material: matId as any,
+                          cost: Math.round(dist * spec.costPerMeter),
+                          weight: dist * spec.density
+                        });
+                      }
+                    }
+                    setContextMenu(prev => ({ ...prev, show: false }));
+                  }}
+                  className="w-full text-left px-3 py-1.5 hover:bg-neutral-800 hover:text-white flex items-center justify-between cursor-pointer"
+                >
+                  <span className="flex items-center gap-1.5">
+                    <span className="w-2 h-2 rounded-full" style={{ backgroundColor: spec.color }} />
+                    {spec.nameKo}
+                  </span>
+                  <span className="text-[10px] text-neutral-500 font-mono">
+                    ₩{(spec.costPerMeter / 1000).toFixed(0)}k/m
+                  </span>
+                </button>
+              ))}
+
+              {contextMenu.targetType === 'wall' && Object.entries(WALL_MATERIALS).map(([matId, spec]) => (
+                <button
+                  key={matId}
+                  onClick={() => {
+                    const ids = selectedDebugIdsRef.current;
+                    const id = contextMenu.targetId!;
+                    if (ids.includes(id)) {
+                      ids.forEach(wallId => {
+                        const w = wallsRef.current.find(item => item.id === wallId);
+                        if (w && onUpdateWallRef.current) {
+                          const startVec = new THREE.Vector3(w.start.x, w.start.y, w.start.z);
+                          const endVec = new THREE.Vector3(w.end.x, w.end.y, w.end.z);
+                          const dist = startVec.distanceTo(endVec);
+                          onUpdateWallRef.current({
+                            ...w,
+                            material: matId as any,
+                            cost: Math.round(dist * 3 * spec.costPerSqm),
+                            weight: dist * 3 * spec.weightPerSqm
+                          });
+                        }
+                      });
+                    } else {
+                      const wall = wallsRef.current.find(item => item.id === id);
+                      if (wall && onUpdateWallRef.current) {
+                        const startVec = new THREE.Vector3(wall.start.x, wall.start.y, wall.start.z);
+                        const endVec = new THREE.Vector3(wall.end.x, wall.end.y, wall.end.z);
+                        const dist = startVec.distanceTo(endVec);
+                        onUpdateWallRef.current({
+                          ...wall,
+                          material: matId as any,
+                          cost: Math.round(dist * 3 * spec.costPerSqm),
+                          weight: dist * 3 * spec.weightPerSqm
+                        });
+                      }
+                    }
+                    setContextMenu(prev => ({ ...prev, show: false }));
+                  }}
+                  className="w-full text-left px-3 py-1.5 hover:bg-neutral-800 hover:text-white flex items-center justify-between cursor-pointer"
+                >
+                  <span className="flex items-center gap-1.5">
+                    <span className="w-2 h-2 rounded-full" style={{ backgroundColor: spec.color }} />
+                    {spec.nameKo}
+                  </span>
+                  <span className="text-[10px] text-neutral-500 font-mono">
+                    ₩{(spec.costPerSqm / 1000).toFixed(0)}k/㎡
+                  </span>
+                </button>
+              ))}
+
+              {contextMenu.targetType === 'utility' && Object.entries(UTILITIES).map(([typeId, spec]) => (
+                <button
+                  key={typeId}
+                  onClick={() => {
+                    const ids = selectedDebugIdsRef.current;
+                    const id = contextMenu.targetId!;
+                    if (ids.includes(id)) {
+                      ids.forEach(utilId => {
+                        const u = utilitiesRef.current.find(item => item.id === utilId);
+                        if (u && onUpdateUtilityRef.current) {
+                          onUpdateUtilityRef.current({
+                            ...u,
+                            type: typeId as any,
+                            cost: spec.cost
+                          });
+                        }
+                      });
+                    } else {
+                      const util = utilitiesRef.current.find(item => item.id === id);
+                      if (util && onUpdateUtilityRef.current) {
+                        onUpdateUtilityRef.current({
+                          ...util,
+                          type: typeId as any,
+                          cost: spec.cost
+                        });
+                      }
+                    }
+                    setContextMenu(prev => ({ ...prev, show: false }));
+                  }}
+                  className="w-full text-left px-3 py-1.5 hover:bg-neutral-800 hover:text-white flex items-center justify-between cursor-pointer"
+                >
+                  <span className="flex items-center gap-1.5">
+                    <span className="w-2 h-2 rounded-full" style={{ backgroundColor: spec.color }} />
+                    {spec.nameKo}
+                  </span>
+                  <span className="text-[10px] text-neutral-500 font-mono">
+                    ₩{(spec.cost / 1000).toFixed(0)}k
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
+
+          {/* Delete Option (Requires active target) */}
+          {contextMenu.targetId && (
+            <button
+              onClick={() => {
+                const ids = selectedDebugIdsRef.current;
+                const targetId = contextMenu.targetId!;
+                if (ids.includes(targetId)) {
+                  ids.forEach(id => {
+                    const f = framesRef.current.find(item => item.id === id);
+                    if (f) onDeleteElementRef.current(id, 'frame');
+                    const w = wallsRef.current.find(item => item.id === id);
+                    if (w) onDeleteElementRef.current(id, 'wall');
+                    const u = utilitiesRef.current.find(item => item.id === id);
+                    if (u) onDeleteElementRef.current(id, 'utility');
+                  });
+                  setSelectedDebugIds([]);
+                } else {
+                  onDeleteElementRef.current(targetId, contextMenu.targetType!);
+                }
+                setSelectedDebugId(null);
+                setContextMenu(prev => ({ ...prev, show: false }));
+              }}
+              className="w-full text-left px-3 py-2 hover:bg-red-950/80 hover:text-red-200 border-t border-neutral-800 mt-1 pt-2 flex items-center gap-2 cursor-pointer text-red-400 transition-colors"
+            >
+              <Trash2 className="w-3.5 h-3.5 text-red-500" />
+              <span>삭제하기 (Delete)</span>
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }

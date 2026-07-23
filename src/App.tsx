@@ -275,8 +275,8 @@ export default function App() {
 
   // Helper values
   const totalCost = 
-    frames.reduce((sum, f) => sum + f.cost, 0) +
-    walls.reduce((sum, w) => sum + w.cost, 0) +
+    frames.reduce((sum, f) => sum + f.cost + (f.welded ? 35000 : 0), 0) +
+    walls.reduce((sum, w) => sum + w.cost + (w.welded ? 35000 : 0), 0) +
     utilities.reduce((sum, u) => sum + u.cost, 0);
 
   const totalDamageCost = collapseReason ? totalCost : Math.round(totalCost * (1 - structuralIntegrity / 100));
@@ -494,9 +494,17 @@ export default function App() {
                   <div className="flex justify-between">
                     <span className="text-neutral-500">예상 골조 비용:</span>
                     <span className="font-bold text-indigo-400 font-mono">
-                      ₩{frames.reduce((sum, f) => sum + f.cost, 0).toLocaleString()}
+                      ₩{(frames.reduce((sum, f) => sum + f.cost, 0)).toLocaleString()}
                     </span>
                   </div>
+                  {frames.some(f => f.welded) && (
+                    <div className="flex justify-between text-[11px] text-cyan-400">
+                      <span>└ 추가 강도 용접 ({frames.filter(f => f.welded).length}개):</span>
+                      <span className="font-bold font-mono">
+                        +₩{(frames.filter(f => f.welded).length * 35000).toLocaleString()}
+                      </span>
+                    </div>
+                  )}
                 </div>
               </div>
             )}
@@ -511,6 +519,20 @@ export default function App() {
                     <span className="text-neutral-500">배치된 외벽 수:</span>
                     <span className="font-bold text-white font-mono">{walls.length}개</span>
                   </div>
+                  <div className="flex justify-between">
+                    <span className="text-neutral-500">예상 외벽 비용:</span>
+                    <span className="font-bold text-indigo-400 font-mono">
+                      ₩{walls.reduce((sum, w) => sum + w.cost, 0).toLocaleString()}
+                    </span>
+                  </div>
+                  {walls.some(w => w.welded) && (
+                    <div className="flex justify-between text-[11px] text-cyan-400">
+                      <span>└ 추가 벽체 용접 ({walls.filter(w => w.welded).length}개):</span>
+                      <span className="font-bold font-mono">
+                        +₩{(walls.filter(w => w.welded).length * 35000).toLocaleString()}
+                      </span>
+                    </div>
+                  )}
                   <div className="flex justify-between">
                     <span className="text-neutral-500">배치된 안전 설비:</span>
                     <span className="font-bold text-white font-mono">{utilities.length}개</span>

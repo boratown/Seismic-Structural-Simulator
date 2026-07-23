@@ -56,6 +56,7 @@ export interface FrameElement {
   cost: number;
   weight: number;
   durability: number; // current durability
+  welded?: boolean;
 }
 
 export interface WallElement {
@@ -67,6 +68,7 @@ export interface WallElement {
   cost: number;
   weight: number;
   height?: number;
+  welded?: boolean;
 }
 
 export interface UtilityElement {
