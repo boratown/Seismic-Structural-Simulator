@@ -1,0 +1,6 @@
+{
+  "name": "3D Seismic Structural Simulator",
+  "description": "3D 가상 빌딩 시뮬레이터로 건물의 뼈대와 벽을 건설하고, 지진, 쓰나미, 토네이도, 홍수 등의 자연재해 속에서 내진 설계를 테스트하며 내진연한과 내구성을 시각화합니다.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

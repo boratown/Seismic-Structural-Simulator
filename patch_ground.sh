@@ -1,0 +1,1 @@
+sed -i 's/(physicsGround as any).initialX = physicsGround.position.x;/(physicsGround as any).initialX = physicsGround.position.x;\n      (physicsGround as any).isGround = true;/g' src/components/SimulatorCanvas.tsx
